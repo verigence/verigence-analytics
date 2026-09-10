@@ -36,7 +36,7 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          os.environ['DATABASE_URL']='postgresql://unused:unused@localhost/unused'
+          os.environ['ANALYTICS_DB_URL']='postgresql://unused:unused@localhost/unused'
           os.environ['ANALYTICS_SECURITY_JWKS_URL']='https://example.invalid/jwks'
           os.environ['SECURITY_TOKEN_ISSUER']='verigence-security'
           os.environ['SECURITY_TOKEN_AUDIENCE']='verigence-platform'

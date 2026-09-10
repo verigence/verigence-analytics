@@ -1,6 +1,6 @@
 import os
 
-os.environ.setdefault("DATABASE_URL", "postgresql://unused:unused@localhost/unused")
+os.environ.setdefault("ANALYTICS_DB_URL", "postgresql://unused:unused@localhost/unused")
 os.environ.setdefault("ANALYTICS_SECURITY_JWKS_URL", "https://example.invalid/jwks")
 os.environ.setdefault("SECURITY_TOKEN_ISSUER", "verigence-security")
 os.environ.setdefault("SECURITY_TOKEN_AUDIENCE", "verigence-platform")
