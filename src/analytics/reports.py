@@ -233,3 +233,19 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
             GROUP BY 1,2,3 ORDER BY activity_date DESC NULLS LAST, activity_count DESC
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
     return {"tenant_id": tenant_id, "data_as_of": latest["data_as_of_utc"], "rows": rows}
+
+
+@router.get("/dashboard")
+def dashboard(tenant_id: str, principal: Annotated[Principal, Depends(require_analytics_read)]) -> dict:
+    """Return the initial Analytics screen in one authenticated request.
+
+    Calling the report functions directly reuses the already-authorized principal,
+    so the browser no longer fans out five concurrent Security authorization checks.
+    """
+    return {
+        "overview": overview(tenant_id, principal),
+        "findings": findings(tenant_id, principal),
+        "documents": documents(tenant_id, principal),
+        "payments": payments(tenant_id, principal),
+        "turnaround": turnaround(tenant_id, principal),
+    }
