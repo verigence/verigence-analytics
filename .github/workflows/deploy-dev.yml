@@ -63,6 +63,11 @@ jobs:
           set -euo pipefail
           env -u RAILWAY_TOKEN railway up . --path-as-root --service "$ANALYTICS_SERVICE" --ci --yes --message "Analytics DEV ${DEPLOY_SHA}"
           echo "ANALYTICS_DEPLOYMENT=PASS"
+      - name: Railway failure diagnostics
+        if: failure()
+        run: |
+          env -u RAILWAY_TOKEN railway logs --service "$ANALYTICS_SERVICE" --build --lines 220 || true
+          env -u RAILWAY_TOKEN railway logs --service "$ANALYTICS_SERVICE" --deployment --lines 220 || true
       - name: Smoke test Analytics
         run: |
           set -euo pipefail
