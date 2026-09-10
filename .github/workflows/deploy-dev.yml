@@ -70,29 +70,29 @@ jobs:
           set -euo pipefail
           env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
           import os
-          import psycopg
-          url=os.environ['ANALYTICS_DB_URL']
-          with psycopg.connect(url) as conn:
-              with conn.cursor() as cur:
-                  cur.execute("SELECT current_database(), to_regnamespace('auditcore') IS NOT NULL")
-                  database_name, has_auditcore = cur.fetchone()
-                  if not has_auditcore:
-                      raise SystemExit('ANALYTICS_DB_URL does not point to a database containing auditcore schema')
-                  cur.execute("SELECT count(*) FROM auditcore.journeys")
-                  journey_count=cur.fetchone()[0]
-                  print(f'ANALYTICS_DB_SOURCE=PASS|database={database_name}|auditcore_journeys={journey_count}')
+          from sqlalchemy import create_engine, text
+          engine=create_engine(os.environ['ANALYTICS_DB_URL'])
+          with engine.connect() as conn:
+              database_name, has_auditcore=conn.execute(
+                  text("SELECT current_database(), to_regnamespace('auditcore') IS NOT NULL")
+              ).one()
+              if not has_auditcore:
+                  raise SystemExit('ANALYTICS_DB_URL does not point to a database containing auditcore schema')
+              journey_count=conn.execute(text("SELECT count(*) FROM auditcore.journeys")).scalar_one()
+              print(f'ANALYTICS_DB_SOURCE=PASS|database={database_name}|auditcore_journeys={journey_count}')
           PY
           env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" alembic upgrade head
           env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
           import os
-          import psycopg
-          with psycopg.connect(os.environ['ANALYTICS_DB_URL']) as conn:
-              with conn.cursor() as cur:
-                  cur.execute("SELECT to_regclass('analytics.dump_runs'), to_regclass('analytics.snapshot_rows')")
-                  dump_runs, snapshot_rows=cur.fetchone()
-                  if dump_runs is None or snapshot_rows is None:
-                      raise SystemExit('Analytics migration did not create required tables')
-                  print('ANALYTICS_SCHEMA_MIGRATION=PASS')
+          from sqlalchemy import create_engine, text
+          engine=create_engine(os.environ['ANALYTICS_DB_URL'])
+          with engine.connect() as conn:
+              dump_runs, snapshot_rows=conn.execute(
+                  text("SELECT to_regclass('analytics.dump_runs'), to_regclass('analytics.snapshot_rows')")
+              ).one()
+              if dump_runs is None or snapshot_rows is None:
+                  raise SystemExit('Analytics migration did not create required tables')
+              print('ANALYTICS_SCHEMA_MIGRATION=PASS')
           PY
       - name: Deploy and verify Analytics
         run: |
