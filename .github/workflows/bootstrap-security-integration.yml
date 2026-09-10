@@ -1,0 +1,65 @@
+name: Bootstrap Analytics Security Integration DEV
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/bootstrap_security_integration.py
+      - .github/workflows/bootstrap-security-integration.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+      ANALYTICS_SERVICE: analytics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bootstrap dependencies
+        run: |
+          python -m pip install -r requirements.txt argon2-cffi
+          npm install --global @railway/cli
+      - name: Link Analytics DEV
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          env -u RAILWAY_TOKEN railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/dev/null
+      - name: Provision Security ServiceIntegration
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python scripts/bootstrap_security_integration.py
+      - name: Prove Security token issuance
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          import os
+          import httpx
+
+          jwks=os.environ['ANALYTICS_SECURITY_JWKS_URL'].rstrip('/')
+          suffix='/.well-known/jwks.json'
+          if not jwks.endswith(suffix):
+              raise SystemExit('ANALYTICS_SECURITY_JWKS_URL cannot derive Security base URL')
+          base=jwks[:-len(suffix)]
+          response=httpx.post(
+              base+'/security/v1/service/token',
+              auth=('analytics', os.environ['ANALYTICS_SECRET_KEY']),
+              data={'audience':'security'},
+              timeout=5.0,
+          )
+          if response.status_code != 200:
+              raise SystemExit(f'Analytics Security token issue failed: HTTP {response.status_code}')
+          payload=response.json()
+          if payload.get('tokenType') != 'Bearer' or payload.get('audience') != 'security' or not payload.get('accessToken'):
+              raise SystemExit('Analytics Security token response contract mismatch')
+          print('ANALYTICS_SECURITY_TOKEN=PASS|audience=security')
+          PY
