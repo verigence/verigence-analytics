@@ -10,9 +10,9 @@ if config.config_file_name is not None:
 
 
 def _database_url() -> str:
-    raw = os.environ.get("DATABASE_URL_DIRECT", "").strip() or os.environ.get("DATABASE_URL", "").strip()
+    raw = os.environ.get("ANALYTICS_DB_URL", "").strip()
     if not raw:
-        raise RuntimeError("DATABASE_URL_DIRECT or DATABASE_URL is required")
+        raise RuntimeError("ANALYTICS_DB_URL is required")
     for prefix, replacement in (
         ("postgresql+asyncpg://", "postgresql+psycopg://"),
         ("postgresql://", "postgresql+psycopg://"),
