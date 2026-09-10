@@ -1,0 +1,71 @@
+name: Expose Analytics DEV
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/expose-analytics-dev.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  expose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+      ANALYTICS_SERVICE: analytics
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Link Analytics DEV
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          env -u RAILWAY_TOKEN railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/dev/null
+      - name: Generate or reuse Railway public domain
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway domain list --service "$ANALYTICS_SERVICE" --json >/tmp/domains.json
+          python - <<'PY' >/tmp/existing_domain
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/domains.json').read_text() or '[]')
+          rows=data if isinstance(data,list) else data.get('domains',[]) if isinstance(data,dict) else []
+          for row in rows:
+              domain=(row.get('domain') or row.get('name') or '').strip() if isinstance(row,dict) else ''
+              if domain.endswith('.up.railway.app') or domain.endswith('.railway.app'):
+                  print(domain)
+                  break
+          PY
+          domain="$(cat /tmp/existing_domain)"
+          if [[ -z "$domain" ]]; then
+            env -u RAILWAY_TOKEN railway domain --service "$ANALYTICS_SERVICE" --json >/tmp/created_domain.json
+            python - <<'PY' >/tmp/existing_domain
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/created_domain.json').read_text())
+          if isinstance(data,str):
+              print(data.removeprefix('https://').rstrip('/'))
+          elif isinstance(data,dict):
+              print((data.get('domain') or data.get('name') or data.get('url') or '').removeprefix('https://').rstrip('/'))
+          PY
+            domain="$(cat /tmp/existing_domain)"
+          fi
+          [[ -n "$domain" ]] || { echo '::error::Railway did not return an Analytics public domain'; exit 1; }
+          case "$domain" in http://*|https://*) base="${domain%/}" ;; *) base="https://${domain%/}" ;; esac
+          for attempt in {1..20}; do
+            if curl --fail --silent --show-error "$base/health" >/tmp/health.json 2>/dev/null; then
+              echo "ANALYTICS_PUBLIC_URL=$base"
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 3
+          done
+          echo '::error::Analytics public domain was created but health did not become reachable'
+          exit 1
