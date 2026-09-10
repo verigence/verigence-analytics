@@ -2,7 +2,7 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import create_engine, pool
+from sqlalchemy import create_engine, pool, text
 
 config = context.config
 if config.config_file_name is not None:
@@ -24,7 +24,13 @@ def _database_url() -> str:
 
 
 def run_migrations_offline() -> None:
-    context.configure(url=_database_url(), literal_binds=True, dialect_opts={"paramstyle": "named"})
+    context.configure(
+        url=_database_url(),
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        version_table="alembic_version",
+        version_table_schema="analytics",
+    )
     with context.begin_transaction():
         context.run_migrations()
 
@@ -32,7 +38,13 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     connectable = create_engine(_database_url(), poolclass=pool.NullPool)
     with connectable.connect() as connection:
-        context.configure(connection=connection)
+        connection.execute(text("CREATE SCHEMA IF NOT EXISTS analytics"))
+        connection.commit()
+        context.configure(
+            connection=connection,
+            version_table="alembic_version",
+            version_table_schema="analytics",
+        )
         with context.begin_transaction():
             context.run_migrations()
 
