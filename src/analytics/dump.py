@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
@@ -88,7 +88,7 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
         raise ValueError("tenant_id is required")
     settings = load_settings(require_security=False)
     dump_id = uuid4()
-    started = datetime.now(timezone.utc)
+    started = datetime.now(UTC)
 
     with analytics_engine().begin() as target:
         target.execute(
@@ -134,7 +134,13 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                             if not batch:
                                 break
                             dict_batch = [dict(row) for row in batch]
-                            _insert_batch(target, dump_id=dump_id, tenant_id=tenant_id, table=table_name, rows=dict_batch)
+                            _insert_batch(
+                                target,
+                                dump_id=dump_id,
+                                tenant_id=tenant_id,
+                                table=table_name,
+                                rows=dict_batch,
+                            )
                             table_count += len(dict_batch)
                         counts[table_name] = table_count
                         total += table_count
@@ -143,7 +149,7 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                 tx.rollback()
                 raise
 
-        completed = datetime.now(timezone.utc)
+        completed = datetime.now(UTC)
         with analytics_engine().begin() as target:
             target.execute(
                 text(
@@ -155,7 +161,12 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                     WHERE dump_id=:dump_id
                     """
                 ),
-                {"completed": completed, "row_count": total, "table_counts": json.dumps(counts), "dump_id": dump_id},
+                {
+                    "completed": completed,
+                    "row_count": total,
+                    "table_counts": json.dumps(counts),
+                    "dump_id": dump_id,
+                },
             )
             target.execute(
                 text(
