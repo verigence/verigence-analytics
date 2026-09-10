@@ -58,29 +58,11 @@ jobs:
           print('ANALYTICS_RAILWAY_TARGET=PASS')
           print('ANALYTICS_RUNTIME_CONFIG=PASS')
           PY
-      - name: Deploy Analytics
+      - name: Deploy and verify Analytics
         run: |
           set -euo pipefail
-          env -u RAILWAY_TOKEN railway up . --path-as-root --service "$ANALYTICS_SERVICE" --detach --yes --message "Analytics DEV ${DEPLOY_SHA}" >/dev/null
-      - name: Verify fresh Analytics deployment
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 30); do
-            env -u RAILWAY_TOKEN railway deployment list --service "$ANALYTICS_SERVICE" --limit 1 --json >/tmp/deployment.json
-            read -r deployment_id status <<<"$(python - <<'PY'
-          import json
-          from pathlib import Path
-          rows=json.loads(Path('/tmp/deployment.json').read_text())
-          print((rows[0].get('id','')+' '+rows[0].get('status','')) if rows else ' ')
-          PY
-          )"
-            case "$status" in
-              SUCCESS) echo "ANALYTICS_DEPLOYMENT=PASS|$deployment_id"; break ;;
-              FAILED|CRASHED|REMOVED) env -u RAILWAY_TOKEN railway logs --service "$ANALYTICS_SERVICE" --latest --deployment --lines 220 || true; exit 1 ;;
-            esac
-            if [[ "$attempt" == "30" ]]; then exit 1; fi
-            sleep 10
-          done
+          env -u RAILWAY_TOKEN railway up . --path-as-root --service "$ANALYTICS_SERVICE" --ci --yes --message "Analytics DEV ${DEPLOY_SHA}"
+          echo "ANALYTICS_DEPLOYMENT=PASS"
       - name: Smoke test Analytics
         run: |
           set -euo pipefail
