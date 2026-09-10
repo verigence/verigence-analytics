@@ -31,8 +31,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.DEPLOY_SHA }}
-      - name: Install Railway CLI
-        run: npm install --global @railway/cli
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install migration dependencies and Railway CLI
+        run: |
+          python -m pip install -r requirements.txt
+          npm install --global @railway/cli
       - name: Link and verify Analytics Railway DEV target
         shell: bash
         run: |
@@ -57,6 +63,36 @@ jobs:
           if missing: raise SystemExit('Analytics Railway DEV is missing required service variables: '+','.join(missing))
           print('ANALYTICS_RAILWAY_TARGET=PASS')
           print('ANALYTICS_RUNTIME_CONFIG=PASS')
+          PY
+      - name: Verify source DB and migrate Analytics schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          import os
+          import psycopg
+          url=os.environ['ANALYTICS_DB_URL']
+          with psycopg.connect(url) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT current_database(), to_regnamespace('auditcore') IS NOT NULL")
+                  database_name, has_auditcore = cur.fetchone()
+                  if not has_auditcore:
+                      raise SystemExit('ANALYTICS_DB_URL does not point to a database containing auditcore schema')
+                  cur.execute("SELECT count(*) FROM auditcore.journeys")
+                  journey_count=cur.fetchone()[0]
+                  print(f'ANALYTICS_DB_SOURCE=PASS|database={database_name}|auditcore_journeys={journey_count}')
+          PY
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" alembic upgrade head
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          import os
+          import psycopg
+          with psycopg.connect(os.environ['ANALYTICS_DB_URL']) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT to_regclass('analytics.dump_runs'), to_regclass('analytics.snapshot_rows')")
+                  dump_runs, snapshot_rows=cur.fetchone()
+                  if dump_runs is None or snapshot_rows is None:
+                      raise SystemExit('Analytics migration did not create required tables')
+                  print('ANALYTICS_SCHEMA_MIGRATION=PASS')
           PY
       - name: Deploy and verify Analytics
         run: |
