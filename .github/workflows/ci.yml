@@ -41,7 +41,7 @@ jobs:
           os.environ['SECURITY_ISSUER']='https://example.invalid'
           os.environ['SECURITY_AUDIENCE']='verigence'
           from analytics.main import app
-          paths={r.path for r in app.routes}
+          paths=set(app.openapi()['paths'])
           required={
               '/health','/ready',
               '/v1/analytics/tenants/{tenant_id}/sync-state',
