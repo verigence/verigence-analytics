@@ -1,0 +1,128 @@
+name: Verify Analytics Security RBAC DEV
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/verify-security-rbac-dev.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+      ANALYTICS_SERVICE: analytics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          npm install --global @railway/cli
+      - name: Link Analytics DEV
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/dev/null
+      - name: Prove allowed denied and wrong-tenant decisions
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          import os
+          import httpx
+          from sqlalchemy import create_engine, text
+
+          def db_url():
+              url=os.environ['ANALYTICS_DB_URL']
+              for prefix,replacement in (
+                  ('postgresql+asyncpg://','postgresql+psycopg://'),
+                  ('postgresql://','postgresql+psycopg://'),
+                  ('postgres://','postgresql+psycopg://'),
+              ):
+                  if url.startswith(prefix): return replacement+url[len(prefix):]
+              return url
+
+          engine=create_engine(db_url())
+          with engine.connect() as c:
+              allowed=c.execute(text("""
+                  SELECT r.user_id::text AS user_id,r.tenant_id::text AS tenant_id,r.role_key
+                  FROM security.user_tenant_operating_roles r
+                  JOIN security.users u ON u.user_id=r.user_id AND u.status='ACTIVE'
+                  JOIN security.external_identities e ON e.user_id=u.user_id AND e.provider='CLERK' AND e.status='ACTIVE'
+                  JOIN security.tenant_role_permissions p ON p.tenant_id=r.tenant_id AND p.role_key=r.role_key
+                  WHERE r.status='ACTIVE' AND p.permission_key='audit.analytics.read'
+                    AND (r.valid_from_utc IS NULL OR r.valid_from_utc<=CURRENT_TIMESTAMP)
+                    AND (r.valid_to_utc IS NULL OR r.valid_to_utc>CURRENT_TIMESTAMP)
+                  LIMIT 1
+              """)).mappings().first()
+              denied=c.execute(text("""
+                  SELECT r.user_id::text AS user_id,r.tenant_id::text AS tenant_id,r.role_key
+                  FROM security.user_tenant_operating_roles r
+                  JOIN security.users u ON u.user_id=r.user_id AND u.status='ACTIVE'
+                  JOIN security.external_identities e ON e.user_id=u.user_id AND e.provider='CLERK' AND e.status='ACTIVE'
+                  WHERE r.status='ACTIVE'
+                    AND NOT EXISTS (
+                      SELECT 1 FROM security.tenant_role_permissions p
+                      WHERE p.tenant_id=r.tenant_id AND p.role_key=r.role_key
+                        AND p.permission_key='audit.analytics.read'
+                    )
+                  LIMIT 1
+              """)).mappings().first()
+              if not allowed or not denied:
+                  raise SystemExit('Could not resolve both allowed and denied DEV role fixtures')
+              wrong_tenant=c.execute(text("""
+                  SELECT tenant_id::text
+                  FROM security.tenants
+                  WHERE status='ACTIVE' AND tenant_id<>CAST(:tenant_id AS uuid)
+                    AND NOT EXISTS (
+                      SELECT 1 FROM security.user_tenant_operating_roles r
+                      WHERE r.user_id=CAST(:user_id AS uuid) AND r.tenant_id=security.tenants.tenant_id AND r.status='ACTIVE'
+                    )
+                  LIMIT 1
+              """), {'tenant_id':allowed['tenant_id'],'user_id':allowed['user_id']}).scalar_one_or_none()
+              if not wrong_tenant:
+                  raise SystemExit('Could not resolve wrong-tenant DEV fixture')
+
+          jwks=os.environ['ANALYTICS_SECURITY_JWKS_URL'].rstrip('/')
+          suffix='/.well-known/jwks.json'
+          if not jwks.endswith(suffix): raise SystemExit('Cannot derive Security base URL')
+          base=jwks[:-len(suffix)]
+          token_response=httpx.post(
+              base+'/security/v1/service/token',
+              auth=('analytics',os.environ['ANALYTICS_SECRET_KEY']),
+              data={'audience':'security'},timeout=5.0,
+          )
+          token_response.raise_for_status()
+          service_token=token_response.json()['accessToken']
+
+          def check(user_id,tenant_id):
+              r=httpx.post(
+                  base+'/security/v1/authorization/check',
+                  headers={'Authorization':f'Bearer {service_token}'},
+                  json={'userId':user_id,'tenantId':tenant_id,'permissionKey':'audit.analytics.read'},
+                  timeout=5.0,
+              )
+              r.raise_for_status()
+              return r.json()
+
+          allow=check(allowed['user_id'],allowed['tenant_id'])
+          deny=check(denied['user_id'],denied['tenant_id'])
+          wrong=check(allowed['user_id'],wrong_tenant)
+          if allow.get('allowed') is not True:
+              raise SystemExit('Expected Analytics read ALLOW did not occur')
+          if deny.get('allowed') is not False:
+              raise SystemExit('Expected Analytics read role DENY did not occur')
+          if wrong.get('allowed') is not False:
+              raise SystemExit('Expected Analytics read wrong-tenant DENY did not occur')
+          print(f"ANALYTICS_SECURITY_RBAC_ALLOW=PASS|role={allowed['role_key']}")
+          print(f"ANALYTICS_SECURITY_RBAC_DENY=PASS|role={denied['role_key']}")
+          print('ANALYTICS_SECURITY_WRONG_TENANT=PASS')
+          PY
