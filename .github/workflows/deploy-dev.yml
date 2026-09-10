@@ -71,7 +71,16 @@ jobs:
           env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
           import os
           from sqlalchemy import create_engine, text
-          engine=create_engine(os.environ['ANALYTICS_DB_URL'])
+          url=os.environ['ANALYTICS_DB_URL']
+          for prefix, replacement in (
+              ('postgresql+asyncpg://','postgresql+psycopg://'),
+              ('postgresql://','postgresql+psycopg://'),
+              ('postgres://','postgresql+psycopg://'),
+          ):
+              if url.startswith(prefix):
+                  url=replacement+url[len(prefix):]
+                  break
+          engine=create_engine(url)
           with engine.connect() as conn:
               database_name, has_auditcore=conn.execute(
                   text("SELECT current_database(), to_regnamespace('auditcore') IS NOT NULL")
@@ -85,7 +94,16 @@ jobs:
           env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
           import os
           from sqlalchemy import create_engine, text
-          engine=create_engine(os.environ['ANALYTICS_DB_URL'])
+          url=os.environ['ANALYTICS_DB_URL']
+          for prefix, replacement in (
+              ('postgresql+asyncpg://','postgresql+psycopg://'),
+              ('postgresql://','postgresql+psycopg://'),
+              ('postgres://','postgresql+psycopg://'),
+          ):
+              if url.startswith(prefix):
+                  url=replacement+url[len(prefix):]
+                  break
+          engine=create_engine(url)
           with engine.connect() as conn:
               dump_runs, snapshot_rows=conn.execute(
                   text("SELECT to_regclass('analytics.dump_runs'), to_regclass('analytics.snapshot_rows')")
