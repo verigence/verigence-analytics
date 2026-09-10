@@ -1,9 +1,9 @@
 import os
 
 os.environ.setdefault("DATABASE_URL", "postgresql://unused:unused@localhost/unused")
-os.environ.setdefault("SECURITY_JWKS_URL", "https://example.invalid/jwks")
-os.environ.setdefault("SECURITY_ISSUER", "https://example.invalid")
-os.environ.setdefault("SECURITY_AUDIENCE", "verigence")
+os.environ.setdefault("ANALYTICS_SECURITY_JWKS_URL", "https://example.invalid/jwks")
+os.environ.setdefault("SECURITY_TOKEN_ISSUER", "verigence-security")
+os.environ.setdefault("SECURITY_TOKEN_AUDIENCE", "verigence-platform")
 
 from analytics.dump import SOURCE_TABLES, _identifier
 from analytics.main import create_app

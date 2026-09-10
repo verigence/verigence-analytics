@@ -25,11 +25,14 @@ def _required(name: str) -> str:
 
 def load_settings(*, require_security: bool = True) -> Settings:
     database_url = _required("DATABASE_URL")
-    security_jwks_url = os.environ.get("SECURITY_JWKS_URL", "").strip()
-    security_issuer = os.environ.get("SECURITY_ISSUER", "").strip()
-    security_audience = os.environ.get("SECURITY_AUDIENCE", "").strip()
+    security_jwks_url = os.environ.get("ANALYTICS_SECURITY_JWKS_URL", "").strip()
+    security_issuer = os.environ.get("SECURITY_TOKEN_ISSUER", "").strip()
+    security_audience = os.environ.get("SECURITY_TOKEN_AUDIENCE", "").strip()
     if require_security and not all((security_jwks_url, security_issuer, security_audience)):
-        raise RuntimeError("SECURITY_JWKS_URL, SECURITY_ISSUER and SECURITY_AUDIENCE are required")
+        raise RuntimeError(
+            "ANALYTICS_SECURITY_JWKS_URL, SECURITY_TOKEN_ISSUER and "
+            "SECURITY_TOKEN_AUDIENCE are required"
+        )
     return Settings(
         app_env=os.environ.get("APP_ENV", "dev").strip() or "dev",
         database_url=database_url,

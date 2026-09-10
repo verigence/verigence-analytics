@@ -52,7 +52,7 @@ jobs:
               raise SystemExit('Railway token does not target the approved shared DEV project')
           if not any(row.get('name') == os.environ['ANALYTICS_SERVICE'] for row in services):
               raise SystemExit('Analytics Railway service is missing')
-          required=['DATABASE_URL','SECURITY_JWKS_URL','SECURITY_ISSUER','SECURITY_AUDIENCE']
+          required=['DATABASE_URL','ANALYTICS_SECURITY_JWKS_URL','SECURITY_TOKEN_ISSUER','SECURITY_TOKEN_AUDIENCE']
           missing=[name for name in required if not str(variables.get(name,'')).strip()]
           if missing: raise SystemExit('Analytics Railway DEV is missing required service variables: '+','.join(missing))
           print('ANALYTICS_RAILWAY_TARGET=PASS')

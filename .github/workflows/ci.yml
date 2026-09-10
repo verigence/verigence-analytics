@@ -37,9 +37,9 @@ jobs:
           python - <<'PY'
           import os
           os.environ['DATABASE_URL']='postgresql://unused:unused@localhost/unused'
-          os.environ['SECURITY_JWKS_URL']='https://example.invalid/jwks'
-          os.environ['SECURITY_ISSUER']='https://example.invalid'
-          os.environ['SECURITY_AUDIENCE']='verigence'
+          os.environ['ANALYTICS_SECURITY_JWKS_URL']='https://example.invalid/jwks'
+          os.environ['SECURITY_TOKEN_ISSUER']='verigence-security'
+          os.environ['SECURITY_TOKEN_AUDIENCE']='verigence-platform'
           from analytics.main import app
           paths=set(app.openapi()['paths'])
           required={
