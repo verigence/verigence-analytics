@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verigence-analytics"
+version = "0.1.0"
+description = "Independent Verigence analytics service"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.139.2",
+    "uvicorn[standard]==0.51.0",
+    "SQLAlchemy==2.0.51",
+    "alembic==1.18.5",
+    "psycopg[binary]==3.3.4",
+    "PyJWT[crypto]==2.13.0",
+    "structlog>=24.1.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1"]
+lint = ["ruff==0.16.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100

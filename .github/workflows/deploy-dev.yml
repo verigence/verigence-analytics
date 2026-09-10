@@ -1,0 +1,99 @@
+name: Deploy Analytics DEV
+
+on:
+  workflow_run:
+    workflows: ["Analytics CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analytics-dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+      ANALYTICS_SERVICE: analytics
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - name: Check out tested Analytics revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Link and verify Analytics Railway DEV target
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          env -u RAILWAY_TOKEN railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/tmp/link.json
+          env -u RAILWAY_TOKEN railway status --json >/tmp/status.json
+          env -u RAILWAY_TOKEN railway service list --json >/tmp/services.json
+          env -u RAILWAY_TOKEN railway variable list --service "$ANALYTICS_SERVICE" --json >/tmp/vars.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          project=json.loads(Path('/tmp/status.json').read_text())
+          services=json.loads(Path('/tmp/services.json').read_text())
+          variables=json.loads(Path('/tmp/vars.json').read_text())
+          if project.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('Railway token does not target the approved shared DEV project')
+          if not any(row.get('name') == os.environ['ANALYTICS_SERVICE'] for row in services):
+              raise SystemExit('Analytics Railway service is missing')
+          required=['DATABASE_URL','SECURITY_JWKS_URL','SECURITY_ISSUER','SECURITY_AUDIENCE']
+          missing=[name for name in required if not str(variables.get(name,'')).strip()]
+          if missing: raise SystemExit('Analytics Railway DEV is missing required service variables: '+','.join(missing))
+          print('ANALYTICS_RAILWAY_TARGET=PASS')
+          print('ANALYTICS_RUNTIME_CONFIG=PASS')
+          PY
+      - name: Deploy Analytics
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway up . --path-as-root --service "$ANALYTICS_SERVICE" --detach --yes --message "Analytics DEV ${DEPLOY_SHA}" >/dev/null
+      - name: Verify fresh Analytics deployment
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            env -u RAILWAY_TOKEN railway deployment list --service "$ANALYTICS_SERVICE" --limit 1 --json >/tmp/deployment.json
+            read -r deployment_id status <<<"$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/deployment.json').read_text())
+          print((rows[0].get('id','')+' '+rows[0].get('status','')) if rows else ' ')
+          PY
+          )"
+            case "$status" in
+              SUCCESS) echo "ANALYTICS_DEPLOYMENT=PASS|$deployment_id"; break ;;
+              FAILED|CRASHED|REMOVED) env -u RAILWAY_TOKEN railway logs --service "$ANALYTICS_SERVICE" --latest --deployment --lines 220 || true; exit 1 ;;
+            esac
+            if [[ "$attempt" == "30" ]]; then exit 1; fi
+            sleep 10
+          done
+      - name: Smoke test Analytics
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway variable list --service "$ANALYTICS_SERVICE" --json >/tmp/vars.json
+          domain="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/vars.json').read_text())
+          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
+          PY
+          )"
+          if [[ -z "$domain" ]]; then echo 'ANALYTICS_PUBLIC_SMOKE=SKIPPED|no public domain configured'; exit 0; fi
+          case "$domain" in http://*|https://*) base="${domain%/}" ;; *) base="https://${domain%/}" ;; esac
+          curl --fail --silent --show-error "$base/health"
+          echo
+          echo "ANALYTICS_PUBLIC_HEALTH=PASS|$base"

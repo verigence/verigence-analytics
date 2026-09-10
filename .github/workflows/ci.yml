@@ -1,0 +1,63 @@
+name: Analytics CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e '.[test,lint]'
+      - name: Compile
+        run: python -m compileall -q src tests migrations
+      - name: Ruff
+        run: ruff check src tests migrations
+      - name: Tests
+        run: pytest -q
+      - name: Alembic single head
+        run: |
+          heads="$(alembic heads | grep -c '(head)' || true)"
+          test "$heads" = "1"
+      - name: Route contract
+        run: |
+          python - <<'PY'
+          import os
+          os.environ['DATABASE_URL']='postgresql://unused:unused@localhost/unused'
+          os.environ['SECURITY_JWKS_URL']='https://example.invalid/jwks'
+          os.environ['SECURITY_ISSUER']='https://example.invalid'
+          os.environ['SECURITY_AUDIENCE']='verigence'
+          from analytics.main import app
+          paths={r.path for r in app.routes}
+          required={
+              '/health','/ready',
+              '/v1/analytics/tenants/{tenant_id}/sync-state',
+              '/v1/analytics/tenants/{tenant_id}/overview',
+              '/v1/analytics/tenants/{tenant_id}/findings',
+              '/v1/analytics/tenants/{tenant_id}/documents',
+              '/v1/analytics/tenants/{tenant_id}/payments',
+              '/v1/analytics/tenants/{tenant_id}/finance',
+              '/v1/analytics/tenants/{tenant_id}/insurance',
+              '/v1/analytics/tenants/{tenant_id}/addons',
+              '/v1/analytics/tenants/{tenant_id}/discounts',
+              '/v1/analytics/tenants/{tenant_id}/trade-in',
+              '/v1/analytics/tenants/{tenant_id}/turnaround',
+              '/v1/analytics/tenants/{tenant_id}/productivity',
+          }
+          missing=required-paths
+          if missing: raise SystemExit('Missing routes: '+','.join(sorted(missing)))
+          print('ANALYTICS_ROUTE_CONTRACT=PASS')
+          PY
