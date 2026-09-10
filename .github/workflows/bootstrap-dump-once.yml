@@ -1,0 +1,75 @@
+name: Bootstrap Analytics Dump Once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bootstrap-dump-once.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+      ANALYTICS_SERVICE: analytics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install runtime dependencies and Railway CLI
+        run: |
+          python -m pip install -r requirements.txt
+          npm install --global @railway/cli
+      - name: Link Analytics DEV
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/dev/null
+      - name: Create initial controlled dumps for all current tenants
+        env:
+          PYTHONPATH: src
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" env PYTHONPATH=src python - <<'PY'
+          from sqlalchemy import text
+          from analytics.db import source_engine, analytics_engine
+          from analytics.dump import create_dump
+
+          with source_engine().connect() as source:
+              source = source.execution_options(isolation_level='REPEATABLE READ')
+              tx = source.begin()
+              try:
+                  source.execute(text('SET TRANSACTION READ ONLY'))
+                  tenant_ids = [
+                      str(row[0])
+                      for row in source.execute(
+                          text('SELECT DISTINCT tenant_id FROM auditcore.journeys WHERE tenant_id IS NOT NULL ORDER BY tenant_id')
+                      )
+                  ]
+                  tx.commit()
+              except Exception:
+                  tx.rollback()
+                  raise
+
+          if not tenant_ids:
+              raise SystemExit('No Audit Core tenants found; initial dump not created')
+
+          print(f'ANALYTICS_BOOTSTRAP_TENANTS={len(tenant_ids)}')
+          for tenant_id in tenant_ids:
+              dump_id = create_dump(tenant_id=tenant_id, requested_by='bootstrap-github-actions')
+              print(f'ANALYTICS_DUMP_COMPLETED|tenant={tenant_id}|dump_id={dump_id}')
+
+          with analytics_engine().connect() as target:
+              completed = target.execute(
+                  text("SELECT count(*) FROM analytics.dump_runs WHERE status='COMPLETED' AND requested_by='bootstrap-github-actions'")
+              ).scalar_one()
+          if completed < len(tenant_ids):
+              raise SystemExit('Not all initial tenant dumps completed')
+          print(f'ANALYTICS_BOOTSTRAP_DUMP=PASS|completed={completed}')
+          PY
