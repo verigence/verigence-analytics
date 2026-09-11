@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from sqlalchemy import text
 
+from analytics.business_intelligence import router as business_intelligence_router
 from analytics.db import analytics_engine
 from analytics.executive_dashboard import router as executive_router
 from analytics.network_reports import router as network_router
@@ -18,6 +19,7 @@ def create_app() -> FastAPI:
     app.include_router(router)
     app.include_router(network_router)
     app.include_router(executive_router)
+    app.include_router(business_intelligence_router)
 
     @app.get("/health")
     def health() -> dict[str, str]:
