@@ -21,11 +21,14 @@ def test_health_route_is_registered() -> None:
     assert "/v1/analytics/tenants/{tenant_id}/findings" in paths
     assert "/v1/analytics/tenants/{tenant_id}/documents" in paths
     assert "/v1/analytics/tenants/{tenant_id}/payments" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-scorecard" in paths
 
 
 def test_dump_sources_cover_business_domains() -> None:
     names = {table.name for table in SOURCE_TABLES}
     required = {
+        "dealers",
+        "dealer_outlets",
         "journeys",
         "bookings",
         "commercial_lines",
