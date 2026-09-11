@@ -5,6 +5,7 @@ from analytics.business_intelligence import router as business_intelligence_rout
 from analytics.db import analytics_engine
 from analytics.executive_dashboard import router as executive_router
 from analytics.network_reports import router as network_router
+from analytics.project_dashboard import router as project_dashboard_router
 from analytics.reports import router
 
 
@@ -20,6 +21,7 @@ def create_app() -> FastAPI:
     app.include_router(network_router)
     app.include_router(executive_router)
     app.include_router(business_intelligence_router)
+    app.include_router(project_dashboard_router)
 
     @app.get("/health")
     def health() -> dict[str, str]:
