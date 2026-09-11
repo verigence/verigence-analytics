@@ -22,6 +22,15 @@ def test_health_route_is_registered() -> None:
     assert "/v1/analytics/tenants/{tenant_id}/documents" in paths
     assert "/v1/analytics/tenants/{tenant_id}/payments" in paths
     assert "/v1/analytics/tenants/{tenant_id}/business-scorecard" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/overview" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/coverage" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/sales-product" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/delivery" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/discounts" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/insurance" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/vas" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/compliance" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/geography" in paths
 
 
 def test_dump_sources_cover_business_domains() -> None:
@@ -31,6 +40,7 @@ def test_dump_sources_cover_business_domains() -> None:
         "dealer_outlets",
         "journeys",
         "bookings",
+        "journey_products",
         "commercial_lines",
         "discount_applications",
         "payments",
@@ -38,7 +48,10 @@ def test_dump_sources_cover_business_domains() -> None:
         "insurance_records",
         "journey_addons",
         "trade_in_cases",
+        "vehicle_records",
+        "registration_records",
         "deliveries",
+        "audit_evaluations",
         "audit_findings",
         "journey_document_requirements",
         "journey_document_assessments",
