@@ -33,7 +33,10 @@ SOURCE_TABLES: tuple[SourceTable, ...] = (
     SourceTable("insurance_records", "insurance_record_id"),
     SourceTable("journey_addons", "journey_addon_id"),
     SourceTable("trade_in_cases", "trade_in_case_id"),
+    SourceTable("vehicle_records", "vehicle_record_id"),
+    SourceTable("registration_records", "registration_record_id"),
     SourceTable("deliveries", "delivery_id"),
+    SourceTable("audit_evaluations", "audit_evaluation_id"),
     SourceTable("audit_findings", "audit_finding_id"),
     SourceTable("review_decisions", "review_decision_id"),
     SourceTable("journey_document_requirements", "journey_document_requirement_id"),
@@ -51,13 +54,23 @@ SOURCE_TABLES: tuple[SourceTable, ...] = (
 )
 
 
+_DERIVED_GEOGRAPHY_TABLE = "derived_customer_geography"
+
+
 def _identifier(value: str) -> str:
     if not value.replace("_", "").isalnum():
         raise ValueError(f"Unsafe SQL identifier: {value}")
     return value
 
 
-def _insert_batch(target: Connection, *, dump_id: UUID, tenant_id: str, table: str, rows: list[dict]) -> None:
+def _insert_batch(
+    target: Connection,
+    *,
+    dump_id: UUID,
+    tenant_id: str,
+    table: str,
+    rows: list[dict],
+) -> None:
     if not rows:
         return
     payload = [
@@ -76,11 +89,133 @@ def _insert_batch(target: Connection, *, dump_id: UUID, tenant_id: str, table: s
             INSERT INTO analytics.snapshot_rows
                 (dump_id, tenant_id, source_table, source_pk, row_data)
             VALUES
-                (CAST(:dump_id AS uuid), :tenant_id, :source_table, :source_pk, CAST(:row_data AS jsonb))
+                (CAST(:dump_id AS uuid), :tenant_id, :source_table, :source_pk,
+                 CAST(:row_data AS jsonb))
             """
         ),
         payload,
     )
+
+
+def _copy_table(
+    source: Connection,
+    target: Connection,
+    *,
+    source_schema: str,
+    source_table: SourceTable,
+    tenant_id: str,
+    dump_id: UUID,
+    batch_size: int,
+) -> int:
+    schema = _identifier(source_schema)
+    table_name = _identifier(source_table.name)
+    primary_key = _identifier(source_table.primary_key)
+    query = text(
+        f"SELECT CAST(t.{primary_key} AS text) AS source_pk, to_jsonb(t) AS row_data "
+        f"FROM {schema}.{table_name} AS t WHERE t.tenant_id = :tenant_id"
+    )
+    result = source.execute(query, {"tenant_id": tenant_id}).mappings()
+    table_count = 0
+    while True:
+        batch = result.fetchmany(batch_size)
+        if not batch:
+            break
+        dict_batch = [dict(row) for row in batch]
+        _insert_batch(
+            target,
+            dump_id=dump_id,
+            tenant_id=tenant_id,
+            table=table_name,
+            rows=dict_batch,
+        )
+        table_count += len(dict_batch)
+    return table_count
+
+
+def _copy_derived_customer_geography(
+    source: Connection,
+    target: Connection,
+    *,
+    source_schema: str,
+    tenant_id: str,
+    dump_id: UUID,
+    batch_size: int,
+) -> int:
+    """Derive a privacy-safe journey PIN without copying the source address.
+
+    Address facts remain in Audit Core. Analytics stores only the selected six-digit
+    Indian PIN and provenance needed to explain the derivation.
+    """
+    schema = _identifier(source_schema)
+    query = text(
+        f"""
+        WITH address_facts AS (
+            SELECT evidence_fact_id,
+                   journey_id,
+                   evidence_id,
+                   field_key,
+                   (regexp_match(
+                       normalized_value,
+                       '(^|[^0-9])([1-9][0-9]{{5}})([^0-9]|$)'
+                   ))[2] AS customer_pincode
+            FROM {schema}.evidence_facts
+            WHERE tenant_id = :tenant_id
+              AND superseded_at_utc IS NULL
+              AND NULLIF(normalized_value, '') IS NOT NULL
+              AND field_key IN (
+                  'customer_address',
+                  'aadhaar_address',
+                  'service_address',
+                  'voter_address',
+                  'licence_address'
+              )
+        ),
+        ranked AS (
+            SELECT *,
+                   row_number() OVER (
+                       PARTITION BY journey_id
+                       ORDER BY
+                           CASE field_key
+                               WHEN 'customer_address' THEN 1
+                               WHEN 'aadhaar_address' THEN 2
+                               WHEN 'service_address' THEN 3
+                               WHEN 'voter_address' THEN 4
+                               WHEN 'licence_address' THEN 5
+                               ELSE 99
+                           END,
+                           evidence_fact_id
+                   ) AS preference_rank
+            FROM address_facts
+            WHERE customer_pincode IS NOT NULL
+        )
+        SELECT CAST(evidence_fact_id AS text) AS source_pk,
+               jsonb_build_object(
+                   'journey_id', CAST(journey_id AS text),
+                   'customer_pincode', customer_pincode,
+                   'source_field_key', field_key,
+                   'source_evidence_id', CAST(evidence_id AS text),
+                   'derivation_method', 'INDIAN_PIN_FROM_ADDRESS'
+               ) AS row_data
+        FROM ranked
+        WHERE preference_rank = 1
+        """
+    )
+    result = source.execute(query, {"tenant_id": tenant_id}).mappings()
+    row_count = 0
+    while True:
+        batch = result.fetchmany(batch_size)
+        if not batch:
+            break
+        dict_batch = [dict(row) for row in batch]
+        _insert_batch(
+            target,
+            dump_id=dump_id,
+            tenant_id=tenant_id,
+            table=_DERIVED_GEOGRAPHY_TABLE,
+            rows=dict_batch,
+        )
+        row_count += len(dict_batch)
+    return row_count
 
 
 def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
@@ -100,7 +235,12 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                     (:dump_id, :tenant_id, 'MANUAL', :requested_by, 'RUNNING', :started_at)
                 """
             ),
-            {"dump_id": dump_id, "tenant_id": tenant_id, "requested_by": requested_by, "started_at": started},
+            {
+                "dump_id": dump_id,
+                "tenant_id": tenant_id,
+                "requested_by": requested_by,
+                "started_at": started,
+            },
         )
 
     counts: dict[str, int] = {}
@@ -120,30 +260,28 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                         raise RuntimeError(f"A dump is already running for tenant {tenant_id}")
 
                     for source_table in SOURCE_TABLES:
-                        schema = _identifier(settings.source_schema)
-                        table_name = _identifier(source_table.name)
-                        primary_key = _identifier(source_table.primary_key)
-                        query = text(
-                            f"SELECT CAST(t.{primary_key} AS text) AS source_pk, to_jsonb(t) AS row_data "
-                            f"FROM {schema}.{table_name} AS t WHERE t.tenant_id = :tenant_id"
+                        table_count = _copy_table(
+                            source,
+                            target,
+                            source_schema=settings.source_schema,
+                            source_table=source_table,
+                            tenant_id=tenant_id,
+                            dump_id=dump_id,
+                            batch_size=settings.dump_batch_size,
                         )
-                        result = source.execute(query, {"tenant_id": tenant_id}).mappings()
-                        table_count = 0
-                        while True:
-                            batch = result.fetchmany(settings.dump_batch_size)
-                            if not batch:
-                                break
-                            dict_batch = [dict(row) for row in batch]
-                            _insert_batch(
-                                target,
-                                dump_id=dump_id,
-                                tenant_id=tenant_id,
-                                table=table_name,
-                                rows=dict_batch,
-                            )
-                            table_count += len(dict_batch)
-                        counts[table_name] = table_count
+                        counts[source_table.name] = table_count
                         total += table_count
+
+                    geography_count = _copy_derived_customer_geography(
+                        source,
+                        target,
+                        source_schema=settings.source_schema,
+                        tenant_id=tenant_id,
+                        dump_id=dump_id,
+                        batch_size=settings.dump_batch_size,
+                    )
+                    counts[_DERIVED_GEOGRAPHY_TABLE] = geography_count
+                    total += geography_count
                 tx.commit()
             except Exception:
                 tx.rollback()
@@ -180,7 +318,11 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                     )
                     """
                 ),
-                {"tenant_id": tenant_id, "dump_id": dump_id, "retain": settings.dump_retention - 1},
+                {
+                    "tenant_id": tenant_id,
+                    "dump_id": dump_id,
+                    "retain": settings.dump_retention - 1,
+                },
             )
         return dump_id
     except Exception as exc:
