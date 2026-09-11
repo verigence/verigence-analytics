@@ -2,6 +2,14 @@
 
 Independent Verigence analytics service.
 
+## Business Analytics source of truth
+
+The target business-reporting state is baselined in:
+
+`docs/VERIGENCE_BUSINESS_ANALYTICS_TO_BE_BASELINE_v1.0.md`
+
+Current sample-data gaps do not reduce that target. Phase 1 uses the data already available through the controlled Analytics snapshot; DI/Audit Core changes are outside this repository and require separate approval.
+
 ## Runtime boundary
 
 - Railway service: `analytics` in the shared Verigence Railway DEV project.
@@ -11,6 +19,7 @@ Independent Verigence analytics service.
 - Audit Core data is copied only by a controlled dump.
 - V1 dump trigger is GitHub Actions `Refresh Analytics Dump` (`workflow_dispatch`).
 - There is no real-time sync. The same dump command can later be scheduled without changing report APIs.
+- Phase 1 implementation changes are confined to this repository.
 
 ## Local checks
 
