@@ -1,0 +1,134 @@
+name: One-time Analytics Dump Cleanup
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cleanup-analytics-dumps.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analytics-one-time-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: github.event.head_commit.message != 'Disable one-time Analytics dump cleanup'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+      ANALYTICS_SERVICE: analytics
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI and database client
+        run: |
+          set -euo pipefail
+          python -m pip install "SQLAlchemy>=2.0,<3" "psycopg[binary]>=3.2,<4"
+          npm install --global @railway/cli
+
+      - name: Link Analytics DEV
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          env -u RAILWAY_TOKEN railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/dev/null
+
+      - name: Enforce retention of current plus one old dump
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway variable set ANALYTICS_DUMP_RETENTION=2 --service "$ANALYTICS_SERVICE"
+
+      - name: Purge Analytics dumps older than the two newest completed dumps
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          url = os.environ["ANALYTICS_DB_URL"]
+          for prefix, replacement in (
+              ("postgresql+asyncpg://", "postgresql+psycopg://"),
+              ("postgresql://", "postgresql+psycopg://"),
+              ("postgres://", "postgresql+psycopg://"),
+          ):
+              if url.startswith(prefix):
+                  url = replacement + url[len(prefix):]
+                  break
+
+          engine = create_engine(url)
+
+          with engine.begin() as conn:
+              before = conn.execute(text("""
+                  SELECT tenant_id, COUNT(*) AS completed_dumps
+                  FROM analytics.dump_runs
+                  WHERE status = 'COMPLETED'
+                  GROUP BY tenant_id
+                  ORDER BY tenant_id
+              """)).all()
+              print("BEFORE:")
+              for tenant_id, count in before:
+                  print(f"tenant={tenant_id} completed_dumps={count}")
+
+              deleted = conn.execute(text("""
+                  WITH ranked AS (
+                      SELECT
+                          dump_id,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY tenant_id
+                              ORDER BY completed_at_utc DESC NULLS LAST, started_at_utc DESC
+                          ) AS rn
+                      FROM analytics.dump_runs
+                      WHERE status = 'COMPLETED'
+                  )
+                  DELETE FROM analytics.dump_runs AS d
+                  USING ranked AS r
+                  WHERE d.dump_id = r.dump_id
+                    AND r.rn > 2
+                  RETURNING d.dump_id, d.tenant_id
+              """)).all()
+
+              print(f"DELETED_COMPLETED_DUMPS={len(deleted)}")
+
+              after = conn.execute(text("""
+                  SELECT tenant_id, COUNT(*) AS completed_dumps
+                  FROM analytics.dump_runs
+                  WHERE status = 'COMPLETED'
+                  GROUP BY tenant_id
+                  ORDER BY tenant_id
+              """)).all()
+              print("AFTER:")
+              for tenant_id, count in after:
+                  if count > 2:
+                      raise RuntimeError(
+                          f"Retention verification failed for tenant {tenant_id}: {count} completed dumps remain"
+                      )
+                  snapshot_count = conn.execute(
+                      text("""
+                          SELECT COUNT(*)
+                          FROM analytics.snapshot_rows sr
+                          JOIN analytics.dump_runs dr ON dr.dump_id = sr.dump_id
+                          WHERE dr.tenant_id = :tenant_id
+                            AND dr.status = 'COMPLETED'
+                      """),
+                      {"tenant_id": tenant_id},
+                  ).scalar_one()
+                  print(f"tenant={tenant_id} completed_dumps={count} retained_snapshot_rows={snapshot_count}")
+
+              orphaned = conn.execute(text("""
+                  SELECT COUNT(*)
+                  FROM analytics.snapshot_rows sr
+                  LEFT JOIN analytics.dump_runs dr ON dr.dump_id = sr.dump_id
+                  WHERE dr.dump_id IS NULL
+              """)).scalar_one()
+              if orphaned:
+                  raise RuntimeError(
+                      f"Snapshot integrity check failed: {orphaned} orphaned snapshot rows"
+                  )
+              print("SNAPSHOT_INTEGRITY=PASS")
+              print("RETENTION=2")
+          PY
