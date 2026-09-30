@@ -83,5 +83,5 @@ def load_settings(*, require_security: bool = True) -> Settings:
         analytics_schema=os.environ.get("ANALYTICS_SCHEMA", "analytics").strip() or "analytics",
         source_schema=os.environ.get("ANALYTICS_SOURCE_SCHEMA", "auditcore").strip() or "auditcore",
         dump_batch_size=max(50, int(os.environ.get("ANALYTICS_DUMP_BATCH_SIZE", "500"))),
-        dump_retention=max(1, int(os.environ.get("ANALYTICS_DUMP_RETENTION", "8"))),
+        dump_retention=max(1, int(os.environ.get("ANALYTICS_DUMP_RETENTION", "2"))),
     )
