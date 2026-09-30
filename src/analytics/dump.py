@@ -309,7 +309,7 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
             target.execute(
                 text(
                     """
-                    DELETE FROM analytics.snapshot_rows
+                    DELETE FROM analytics.dump_runs
                     WHERE dump_id IN (
                         SELECT dump_id FROM analytics.dump_runs
                         WHERE tenant_id=:tenant_id AND status='COMPLETED' AND dump_id <> :dump_id
