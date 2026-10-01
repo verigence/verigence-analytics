@@ -673,131 +673,147 @@ def delivery_business(
 ) -> dict:
     connection, latest = _latest_context(tenant_id)
     try:
-        summary = _scalar_row(
-            _rows(
-                connection,
-                latest,
-                tenant_id,
-                _DEAL_FACTS_CTE
-                + """
-                SELECT count(*) FILTER (
-                           WHERE booking_date IS NOT NULL
-                             AND actual_delivered_at IS NOT NULL
-                             AND actual_delivered_at::date >= booking_date
-                       )::int AS booking_delivery_pairs,
-                       round(avg((actual_delivered_at::date - booking_date)) FILTER (
-                           WHERE booking_date IS NOT NULL
-                             AND actual_delivered_at IS NOT NULL
-                             AND actual_delivered_at::date >= booking_date
-                       ),2) AS avg_booking_to_delivery_days,
-                       percentile_cont(0.5) WITHIN GROUP (
-                           ORDER BY (actual_delivered_at::date - booking_date)
-                       ) FILTER (
-                           WHERE booking_date IS NOT NULL
-                             AND actual_delivered_at IS NOT NULL
-                             AND actual_delivered_at::date >= booking_date
-                       ) AS median_booking_to_delivery_days,
-                       percentile_cont(0.75) WITHIN GROUP (
-                           ORDER BY (actual_delivered_at::date - booking_date)
-                       ) FILTER (
-                           WHERE booking_date IS NOT NULL
-                             AND actual_delivered_at IS NOT NULL
-                             AND actual_delivered_at::date >= booking_date
-                       ) AS p75_booking_to_delivery_days,
-                       percentile_cont(0.9) WITHIN GROUP (
-                           ORDER BY (actual_delivered_at::date - booking_date)
-                       ) FILTER (
-                           WHERE booking_date IS NOT NULL
-                             AND actual_delivered_at IS NOT NULL
-                             AND actual_delivered_at::date >= booking_date
-                       ) AS p90_booking_to_delivery_days,
-                       count(*) FILTER (
-                           WHERE planned_delivery_at IS NOT NULL
-                             AND actual_delivered_at IS NOT NULL
-                       )::int AS planned_actual_pairs,
-                       count(*) FILTER (
-                           WHERE planned_delivery_at IS NOT NULL
-                             AND actual_delivered_at IS NOT NULL
-                             AND actual_delivered_at <= planned_delivery_at
-                       )::int AS on_time_deliveries,
-                       count(*) FILTER (
-                           WHERE booking_date IS NOT NULL
-                             AND allocated_at_utc IS NOT NULL
-                             AND allocated_at_utc::date >= booking_date
-                       )::int AS booking_allocation_pairs,
-                       round(avg((allocated_at_utc::date - booking_date)) FILTER (
-                           WHERE booking_date IS NOT NULL
-                             AND allocated_at_utc IS NOT NULL
-                             AND allocated_at_utc::date >= booking_date
-                       ),2) AS avg_booking_to_allocation_days
-                FROM deal_facts
-                """,
-            )
-        )
-        summary["on_time_delivery_pct"] = _rate(
-            summary.get("on_time_deliveries") or 0,
-            summary.get("planned_actual_pairs") or 0,
-        )
-        by_outlet = _rows(
+        all_rows = _rows(
             connection,
             latest,
             tenant_id,
             _DEAL_FACTS_CTE
             + """
-            SELECT dealer_name, outlet_name,
-                   count(*) FILTER (
-                       WHERE booking_date IS NOT NULL
-                         AND actual_delivered_at IS NOT NULL
-                         AND actual_delivered_at::date >= booking_date
-                   )::int AS completed_count,
-                   round(avg((actual_delivered_at::date - booking_date)) FILTER (
-                       WHERE booking_date IS NOT NULL
-                         AND actual_delivered_at IS NOT NULL
-                         AND actual_delivered_at::date >= booking_date
-                   ),2) AS avg_days,
-                   percentile_cont(0.5) WITHIN GROUP (
-                       ORDER BY (actual_delivered_at::date - booking_date)
-                   ) FILTER (
-                       WHERE booking_date IS NOT NULL
-                         AND actual_delivered_at IS NOT NULL
-                         AND actual_delivered_at::date >= booking_date
-                   ) AS median_days
+            SELECT
+                -- summary row (scope='SUMMARY')
+                'SUMMARY' AS _scope,
+                NULL::text AS dealer_name,
+                NULL::text AS outlet_name,
+                NULL::text AS model_name,
+                count(*) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                )::int AS booking_delivery_pairs,
+                round(avg((actual_delivered_at::date - booking_date)) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                ),2) AS avg_booking_to_delivery_days,
+                percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY (actual_delivered_at::date - booking_date)
+                ) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                ) AS median_booking_to_delivery_days,
+                percentile_cont(0.75) WITHIN GROUP (
+                    ORDER BY (actual_delivered_at::date - booking_date)
+                ) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                ) AS p75_booking_to_delivery_days,
+                percentile_cont(0.9) WITHIN GROUP (
+                    ORDER BY (actual_delivered_at::date - booking_date)
+                ) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                ) AS p90_booking_to_delivery_days,
+                count(*) FILTER (
+                    WHERE planned_delivery_at IS NOT NULL AND actual_delivered_at IS NOT NULL
+                )::int AS planned_actual_pairs,
+                count(*) FILTER (
+                    WHERE planned_delivery_at IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at <= planned_delivery_at
+                )::int AS on_time_deliveries,
+                count(*) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND allocated_at_utc IS NOT NULL
+                      AND allocated_at_utc::date >= booking_date
+                )::int AS booking_allocation_pairs,
+                round(avg((allocated_at_utc::date - booking_date)) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND allocated_at_utc IS NOT NULL
+                      AND allocated_at_utc::date >= booking_date
+                ),2) AS avg_booking_to_allocation_days,
+                NULL::int AS completed_count,
+                NULL::numeric AS avg_days,
+                NULL::float8 AS median_days
+            FROM deal_facts
+            UNION ALL
+            SELECT
+                'OUTLET' AS _scope,
+                dealer_name, outlet_name, NULL::text,
+                NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+                count(*) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                )::int,
+                round(avg((actual_delivered_at::date - booking_date)) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                ),2),
+                percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY (actual_delivered_at::date - booking_date)
+                ) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                )
             FROM deal_facts
             GROUP BY dealer_name, outlet_name
-            ORDER BY completed_count DESC, dealer_name, outlet_name
-            """,
-        )
-        by_model = _rows(
-            connection,
-            latest,
-            tenant_id,
-            _DEAL_FACTS_CTE
-            + """
-            SELECT COALESCE(model_name,'Unresolved') AS model_name,
-                   count(*) FILTER (
-                       WHERE booking_date IS NOT NULL
-                         AND actual_delivered_at IS NOT NULL
-                         AND actual_delivered_at::date >= booking_date
-                   )::int AS completed_count,
-                   round(avg((actual_delivered_at::date - booking_date)) FILTER (
-                       WHERE booking_date IS NOT NULL
-                         AND actual_delivered_at IS NOT NULL
-                         AND actual_delivered_at::date >= booking_date
-                   ),2) AS avg_days,
-                   percentile_cont(0.5) WITHIN GROUP (
-                       ORDER BY (actual_delivered_at::date - booking_date)
-                   ) FILTER (
-                       WHERE booking_date IS NOT NULL
-                         AND actual_delivered_at IS NOT NULL
-                         AND actual_delivered_at::date >= booking_date
-                   ) AS median_days
+            UNION ALL
+            SELECT
+                'MODEL' AS _scope,
+                NULL, NULL, COALESCE(model_name,'Unresolved'),
+                NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+                count(*) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                )::int,
+                round(avg((actual_delivered_at::date - booking_date)) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                ),2),
+                percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY (actual_delivered_at::date - booking_date)
+                ) FILTER (
+                    WHERE booking_date IS NOT NULL
+                      AND actual_delivered_at IS NOT NULL
+                      AND actual_delivered_at::date >= booking_date
+                )
             FROM deal_facts
-            GROUP BY 1
-            ORDER BY completed_count DESC, model_name
+            GROUP BY model_name
+            ORDER BY _scope, completed_count DESC NULLS LAST
             """,
         )
     finally:
         connection.close()
+
+    summary_rows = [r for r in all_rows if r["_scope"] == "SUMMARY"]
+    summary = dict(summary_rows[0]) if summary_rows else {}
+    summary.pop("_scope", None)
+    summary.pop("dealer_name", None)
+    summary.pop("outlet_name", None)
+    summary.pop("model_name", None)
+    summary.pop("completed_count", None)
+    summary.pop("avg_days", None)
+    summary.pop("median_days", None)
+    summary["on_time_delivery_pct"] = _rate(
+        summary.get("on_time_deliveries") or 0,
+        summary.get("planned_actual_pairs") or 0,
+    )
+
+    by_outlet = [
+        {k: v for k, v in r.items() if k not in ("_scope", "model_name")}
+        for r in all_rows if r["_scope"] == "OUTLET"
+    ]
+    by_model = [
+        {k: v for k, v in r.items() if k not in ("_scope", "dealer_name", "outlet_name")}
+        for r in all_rows if r["_scope"] == "MODEL"
+    ]
 
     return {
         "tenant_id": tenant_id,
@@ -1148,84 +1164,112 @@ def compliance_intelligence(
 ) -> dict:
     connection, latest = _latest_context(tenant_id)
     try:
-        by_outlet = _rows(
+        # Single CTE scan covering outlet breakdown, model breakdown, and top rules
+        combined = _rows(
             connection,
             latest,
             tenant_id,
             _DEAL_FACTS_CTE
             + """
-            SELECT dealer_name, outlet_name,
-                   count(*)::int AS journeys,
-                   count(*) FILTER (WHERE finding_count > 0)::int
-                       AS journeys_with_findings,
-                   COALESCE(sum(finding_count),0)::int AS finding_count,
-                   COALESCE(sum(open_finding_count),0)::int AS open_finding_count,
-                   COALESCE(sum(high_finding_count),0)::int AS high_finding_count,
-                   count(*) FILTER (WHERE missing_document_flag_count > 0)::int
-                       AS journeys_with_missing_documents,
-                   COALESCE(sum(actual_discount_amount) FILTER (
-                       WHERE finding_count > 0
-                   ),0) AS discount_value_on_affected_journeys,
-                   COALESCE(sum(payment_amount) FILTER (
-                       WHERE finding_count > 0
-                   ),0) AS payment_value_on_affected_journeys
-            FROM deal_facts
-            GROUP BY dealer_name, outlet_name
-            ORDER BY journeys_with_findings DESC, finding_count DESC,
-                     dealer_name, outlet_name
-            """,
-        )
-        for row in by_outlet:
-            total = int(row.get("journeys") or 0)
-            row["journeys_with_findings_pct"] = _rate(
-                row.get("journeys_with_findings") or 0, total
+            , outlet_agg AS (
+                SELECT 'OUTLET' AS _scope,
+                       dealer_name, outlet_name,
+                       NULL::text AS model_name,
+                       NULL::text AS rule_key, NULL::text AS severity,
+                       NULL::text AS finding_status,
+                       count(*)::int AS journeys,
+                       count(*) FILTER (WHERE finding_count > 0)::int AS journeys_with_findings,
+                       COALESCE(sum(finding_count),0)::int AS finding_count,
+                       COALESCE(sum(open_finding_count),0)::int AS open_finding_count,
+                       COALESCE(sum(high_finding_count),0)::int AS high_finding_count,
+                       count(*) FILTER (WHERE missing_document_flag_count > 0)::int
+                           AS journeys_with_missing_documents,
+                       COALESCE(sum(actual_discount_amount) FILTER (WHERE finding_count > 0),0)
+                           AS discount_value_on_affected_journeys,
+                       COALESCE(sum(payment_amount) FILTER (WHERE finding_count > 0),0)
+                           AS payment_value_on_affected_journeys,
+                       NULL::int AS journey_count
+                FROM deal_facts
+                GROUP BY dealer_name, outlet_name
+            ),
+            model_agg AS (
+                SELECT 'MODEL' AS _scope,
+                       NULL AS dealer_name, NULL AS outlet_name,
+                       COALESCE(model_name,'Unresolved') AS model_name,
+                       NULL, NULL, NULL,
+                       count(*)::int, count(*) FILTER (WHERE finding_count > 0)::int,
+                       COALESCE(sum(finding_count),0)::int,
+                       NULL::int, COALESCE(sum(high_finding_count),0)::int,
+                       NULL::int, NULL::numeric, NULL::numeric, NULL::int
+                FROM deal_facts
+                GROUP BY model_name
             )
-            row["journeys_with_missing_documents_pct"] = _rate(
-                row.get("journeys_with_missing_documents") or 0, total
-            )
-
-        by_model = _rows(
-            connection,
-            latest,
-            tenant_id,
-            _DEAL_FACTS_CTE
-            + """
-            SELECT COALESCE(model_name,'Unresolved') AS model_name,
-                   count(*)::int AS journeys,
-                   count(*) FILTER (WHERE finding_count > 0)::int
-                       AS journeys_with_findings,
-                   COALESCE(sum(finding_count),0)::int AS finding_count,
-                   COALESCE(sum(high_finding_count),0)::int AS high_finding_count
-            FROM deal_facts
-            GROUP BY 1
-            ORDER BY journeys_with_findings DESC, finding_count DESC, model_name
-            """,
-        )
-        for row in by_model:
-            row["journeys_with_findings_pct"] = _rate(
-                row.get("journeys_with_findings") or 0,
-                row.get("journeys") or 0,
-            )
-
-        top_rules = _rows(
-            connection,
-            latest,
-            tenant_id,
-            """
-            SELECT COALESCE(row_data->>'rule_key','UNSPECIFIED') AS rule_key,
-                   COALESCE(row_data->>'severity','UNSPECIFIED') AS severity,
-                   COALESCE(row_data->>'finding_status','UNSPECIFIED') AS finding_status,
-                   count(*)::int AS finding_count,
-                   count(DISTINCT row_data->>'journey_id')::int AS journey_count
+            SELECT * FROM outlet_agg
+            UNION ALL
+            SELECT * FROM model_agg
+            UNION ALL
+            SELECT 'RULE' AS _scope,
+                   NULL, NULL, NULL,
+                   COALESCE(row_data->>'rule_key','UNSPECIFIED'),
+                   COALESCE(row_data->>'severity','UNSPECIFIED'),
+                   COALESCE(row_data->>'finding_status','UNSPECIFIED'),
+                   NULL, NULL,
+                   count(*)::int,
+                   NULL, NULL, NULL, NULL, NULL,
+                   count(DISTINCT row_data->>'journey_id')::int
             FROM analytics.snapshot_rows
             WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='audit_findings'
-            GROUP BY 1,2,3
-            ORDER BY finding_count DESC, rule_key
-            LIMIT 50
+            GROUP BY rule_key, severity, finding_status
+            ORDER BY _scope, finding_count DESC NULLS LAST
             """,
         )
     finally:
         connection.close()
+
+    by_outlet = []
+    for r in combined:
+        if r["_scope"] != "OUTLET":
+            continue
+        total = int(r.get("journeys") or 0)
+        by_outlet.append({
+            "dealer_name": r["dealer_name"],
+            "outlet_name": r["outlet_name"],
+            "journeys": total,
+            "journeys_with_findings": int(r.get("journeys_with_findings") or 0),
+            "finding_count": int(r.get("finding_count") or 0),
+            "open_finding_count": int(r.get("open_finding_count") or 0),
+            "high_finding_count": int(r.get("high_finding_count") or 0),
+            "journeys_with_missing_documents": int(r.get("journeys_with_missing_documents") or 0),
+            "discount_value_on_affected_journeys": r.get("discount_value_on_affected_journeys"),
+            "payment_value_on_affected_journeys": r.get("payment_value_on_affected_journeys"),
+            "journeys_with_findings_pct": _rate(int(r.get("journeys_with_findings") or 0), total),
+            "journeys_with_missing_documents_pct": _rate(int(r.get("journeys_with_missing_documents") or 0), total),
+        })
+
+    by_model = []
+    for r in combined:
+        if r["_scope"] != "MODEL":
+            continue
+        journeys = int(r.get("journeys") or 0)
+        by_model.append({
+            "model_name": r["model_name"],
+            "journeys": journeys,
+            "journeys_with_findings": int(r.get("journeys_with_findings") or 0),
+            "finding_count": int(r.get("finding_count") or 0),
+            "high_finding_count": int(r.get("high_finding_count") or 0),
+            "journeys_with_findings_pct": _rate(int(r.get("journeys_with_findings") or 0), journeys),
+        })
+
+    top_rules = [
+        {
+            "rule_key": r["rule_key"],
+            "severity": r["severity"],
+            "finding_status": r["finding_status"],
+            "finding_count": int(r.get("finding_count") or 0),
+            "journey_count": int(r.get("journey_count") or 0),
+        }
+        for r in combined if r["_scope"] == "RULE"
+    ][:50]
 
     return {
         "tenant_id": tenant_id,

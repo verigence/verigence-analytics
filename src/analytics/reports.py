@@ -253,13 +253,37 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
     with analytics_engine().connect() as connection:
         latest = _latest_dump(connection, tenant_id)
         rows = _query_rows(connection, """
-            SELECT COALESCE(row_data->>'actor_role_snapshot','UNSPECIFIED') AS actor_role,
-                   COALESCE(row_data->>'actor_id','UNSPECIFIED') AS actor_id,
-                   (NULLIF(row_data->>'occurred_at_utc','')::timestamptz)::date AS activity_date,
-                   count(*)::int AS activity_count
-            FROM analytics.snapshot_rows
-            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journey_workflow_events'
-            GROUP BY 1,2,3 ORDER BY activity_date DESC NULLS LAST, activity_count DESC
+            WITH events AS (
+                SELECT COALESCE(row_data->>'actor_role_snapshot','UNSPECIFIED') AS actor_role,
+                       COALESCE(row_data->>'actor_id','UNSPECIFIED') AS actor_id,
+                       (NULLIF(row_data->>'occurred_at_utc','')::timestamptz)::date AS activity_date,
+                       count(*)::int AS activity_count
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                  AND source_table='journey_workflow_events'
+                GROUP BY 1,2,3
+            ),
+            staff AS (
+                SELECT row_data->>'dealership_staff_id' AS staff_id,
+                       COALESCE(
+                           NULLIF(row_data->>'display_name',''),
+                           NULLIF(row_data->>'full_name',''),
+                           NULLIF(row_data->>'email','')
+                       ) AS display_name,
+                       NULLIF(row_data->>'staff_role_code','') AS staff_role_code
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                  AND source_table='dealership_staff'
+            )
+            SELECT e.actor_role,
+                   e.actor_id,
+                   COALESCE(s.display_name, e.actor_id) AS actor_name,
+                   s.staff_role_code,
+                   e.activity_date,
+                   e.activity_count
+            FROM events e
+            LEFT JOIN staff s ON s.staff_id = e.actor_id
+            ORDER BY e.activity_date DESC NULLS LAST, e.activity_count DESC
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
     return {"tenant_id": tenant_id, "data_as_of": latest["data_as_of_utc"], "rows": rows}
 
