@@ -111,7 +111,8 @@ insurance AS (
            NULLIF(row_data->>'actual_premium_amount','')::numeric AS actual_premium_amount,
            NULLIF(row_data->>'standard_premium_amount','')::numeric AS standard_premium_amount,
            NULLIF(row_data->>'self_insurance_flag','')::boolean AS self_insurance_flag,
-           row_data->'add_ons' AS insurance_add_ons
+           row_data->'add_ons' AS insurance_add_ons,
+           NULLIF(row_data->>'insurance_source','') AS insurance_source
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
 ),
@@ -160,7 +161,38 @@ discounts AS (
            sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) AS actual_discount_amount,
            sum(NULLIF(row_data->>'standard_eligible_amount','')::numeric) AS eligible_discount_amount,
            bool_or(NULLIF(row_data->>'actual_discount_amount','') IS NOT NULL) AS actual_present,
-           bool_or(NULLIF(row_data->>'standard_eligible_amount','') IS NOT NULL) AS eligible_present
+           bool_or(NULLIF(row_data->>'standard_eligible_amount','') IS NOT NULL) AS eligible_present,
+           -- per-key actual amounts for discount waterfall charts
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key'='CASH_DISCOUNT'), 0) AS dk_cash_discount,
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key'='EXCHANGE_BONUS'), 0) AS dk_exchange_bonus,
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key' IN ('SCRAPPAGE_BONUS_DEALER','SCRAPPAGE_BONUS_COD')), 0) AS dk_scrappage,
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key'='CORPORATE_PRIVILEGE'), 0) AS dk_corporate,
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key'='WELCOME_BONUS'), 0) AS dk_loyalty,
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key'='INSURANCE'), 0) AS dk_insurance,
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key'='MANAGEMENT_REFERRAL'), 0) AS dk_mr,
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key' IN ('ACCESSORIES_KIT','EXT_WARRANTY_4TH_YR','EXT_WARRANTY_4TH_5TH_YR')), 0) AS dk_scheme_benefit,
+           COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key' IN ('OTHER_SCHEME','ADDITIONAL_DISCOUNT')), 0) AS dk_other,
+           -- eligible per key for standard-vs-actual comparison
+           COALESCE(sum(NULLIF(row_data->>'standard_eligible_amount','')::numeric) FILTER (
+               WHERE row_data->>'discount_key'='MANAGEMENT_REFERRAL'), 0) AS dk_mr_eligible,
+           bool_or(row_data->>'discount_key'='MANAGEMENT_REFERRAL'
+               AND NULLIF(row_data->>'actual_discount_amount','') IS NOT NULL) AS has_mr_discount,
+           -- above-eligible per journey (actual > standard on any single key)
+           bool_or(
+               NULLIF(row_data->>'actual_discount_amount','')::numeric IS NOT NULL
+               AND NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
+               AND NULLIF(row_data->>'actual_discount_amount','')::numeric
+                   > NULLIF(row_data->>'standard_eligible_amount','')::numeric
+           ) AS has_excess_on_any_key
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id
       AND source_table='discount_applications'
@@ -170,6 +202,12 @@ payments AS (
     SELECT row_data->>'journey_id' AS journey_id,
            count(*)::int AS payment_count,
            sum(NULLIF(row_data->>'amount','')::numeric) AS payment_amount,
+           sum(NULLIF(row_data->>'amount','')::numeric) FILTER (
+               WHERE NULLIF(row_data->>'payment_stage','')='BOOKING'
+           ) AS booking_payment_amount,
+           sum(NULLIF(row_data->>'amount','')::numeric) FILTER (
+               WHERE NULLIF(row_data->>'payment_stage','')='DELIVERY'
+           ) AS delivery_payment_amount,
            min(
                COALESCE(
                    NULLIF(row_data->>'receipt_date','')::timestamp,
@@ -205,6 +243,15 @@ geography AS (
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id
       AND source_table='derived_customer_geography'
+),
+mr_discount AS (
+    SELECT row_data->>'journey_id' AS journey_id,
+           (NULLIF(row_data->>'opted','')::boolean) AS mr_opted,
+           NULLIF(row_data->>'amount','')::numeric AS mr_amount,
+           NULLIF(row_data->>'set_by_role','') AS mr_set_by_role
+    FROM analytics.snapshot_rows
+    WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+      AND source_table='p2_management_referrals'
 ),
 deal_facts AS (
     SELECT j.journey_id,
@@ -242,6 +289,8 @@ deal_facts AS (
            i.standard_premium_amount,
            i.self_insurance_flag,
            i.insurance_add_ons,
+           i.insurance_source,
+           (i.journey_id IS NOT NULL AND COALESCE(i.insurance_source,'INHOUSE') = 'INHOUSE') AS has_inhouse_insurance,
            (t.journey_id IS NOT NULL) AS has_trade_in,
            t.trade_in_quoted_value,
            t.trade_in_actual_value,
@@ -258,15 +307,32 @@ deal_facts AS (
            COALESCE(di.eligible_discount_amount,0) AS eligible_discount_amount,
            COALESCE(di.actual_present,false) AS actual_discount_present,
            COALESCE(di.eligible_present,false) AS eligible_discount_present,
+           COALESCE(di.dk_cash_discount,0) AS dk_cash_discount,
+           COALESCE(di.dk_exchange_bonus,0) AS dk_exchange_bonus,
+           COALESCE(di.dk_scrappage,0) AS dk_scrappage,
+           COALESCE(di.dk_corporate,0) AS dk_corporate,
+           COALESCE(di.dk_loyalty,0) AS dk_loyalty,
+           COALESCE(di.dk_insurance,0) AS dk_insurance,
+           COALESCE(di.dk_mr,0) AS dk_mr,
+           COALESCE(di.dk_scheme_benefit,0) AS dk_scheme_benefit,
+           COALESCE(di.dk_other,0) AS dk_other,
+           COALESCE(di.dk_mr_eligible,0) AS dk_mr_eligible,
+           COALESCE(di.has_mr_discount,false) AS has_mr_discount,
+           COALESCE(di.has_excess_on_any_key,false) AS has_excess_on_any_key,
            COALESCE(py.payment_count,0) AS payment_count,
            COALESCE(py.payment_amount,0) AS payment_amount,
+           COALESCE(py.booking_payment_amount,0) AS booking_payment_amount,
+           COALESCE(py.delivery_payment_amount,0) AS delivery_payment_amount,
            py.first_payment_at,
            COALESCE(fi.finding_count,0) AS finding_count,
            COALESCE(fi.open_finding_count,0) AS open_finding_count,
            COALESCE(fi.high_finding_count,0) AS high_finding_count,
            COALESCE(fi.missing_document_flag_count,0) AS missing_document_flag_count,
            g.customer_pincode,
-           g.geography_source_field
+           g.geography_source_field,
+           COALESCE(mr.mr_opted, false) AS mr_opted,
+           mr.mr_amount,
+           mr.mr_set_by_role
     FROM journeys j
     LEFT JOIN dealers d ON d.dealer_id=j.dealer_id
     LEFT JOIN outlets o ON o.outlet_id=j.outlet_id
@@ -283,6 +349,7 @@ deal_facts AS (
     LEFT JOIN payments py ON py.journey_id=j.journey_id
     LEFT JOIN findings fi ON fi.journey_id=j.journey_id
     LEFT JOIN geography g ON g.journey_id=j.journey_id
+    LEFT JOIN mr_discount mr ON mr.journey_id=j.journey_id
 )
 """
 
@@ -1275,5 +1342,809 @@ def commercial_components(
         "note": (
             "Components are reported separately. They are not blindly summed into revenue because "
             "the source component semantics may contain overlapping totals/subtotals."
+        ),
+    }
+
+
+@router.get("/delivery-monthly")
+def delivery_monthly(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Deliveries completed per calendar month with TAT distribution per month."""
+    connection, latest = _latest_context(tenant_id)
+    try:
+        by_month = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT to_char(date_trunc('month', actual_delivered_at), 'YYYY-MM') AS delivery_month,
+                   count(*)::int AS deliveries_completed,
+                   round(avg(actual_delivered_at::date - booking_date),2) AS avg_tat_days,
+                   percentile_cont(0.5) WITHIN GROUP (
+                       ORDER BY (actual_delivered_at::date - booking_date)
+                   ) AS median_tat_days,
+                   min(actual_delivered_at::date - booking_date)::int AS min_tat_days,
+                   max(actual_delivered_at::date - booking_date)::int AS max_tat_days,
+                   percentile_cont(0.9) WITHIN GROUP (
+                       ORDER BY (actual_delivered_at::date - booking_date)
+                   ) AS p90_tat_days
+            FROM deal_facts
+            WHERE actual_delivered_at IS NOT NULL
+              AND booking_date IS NOT NULL
+              AND actual_delivered_at::date >= booking_date
+            GROUP BY 1
+            ORDER BY 1
+            """,
+        )
+        by_model = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT COALESCE(model_name, 'Unresolved') AS model_name,
+                   count(*)::int AS deliveries_completed,
+                   round(avg(actual_delivered_at::date - booking_date),2) AS avg_tat_days,
+                   percentile_cont(0.5) WITHIN GROUP (
+                       ORDER BY (actual_delivered_at::date - booking_date)
+                   ) AS median_tat_days,
+                   min(actual_delivered_at::date - booking_date)::int AS min_tat_days,
+                   max(actual_delivered_at::date - booking_date)::int AS max_tat_days,
+                   percentile_cont(0.9) WITHIN GROUP (
+                       ORDER BY (actual_delivered_at::date - booking_date)
+                   ) AS p90_tat_days
+            FROM deal_facts
+            WHERE actual_delivered_at IS NOT NULL
+              AND booking_date IS NOT NULL
+              AND actual_delivered_at::date >= booking_date
+            GROUP BY 1
+            ORDER BY deliveries_completed DESC, model_name
+            """,
+        )
+        by_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT dealer_name, outlet_name,
+                   count(*)::int AS deliveries_completed,
+                   round(avg(actual_delivered_at::date - booking_date),2) AS avg_tat_days,
+                   percentile_cont(0.5) WITHIN GROUP (
+                       ORDER BY (actual_delivered_at::date - booking_date)
+                   ) AS median_tat_days,
+                   min(actual_delivered_at::date - booking_date)::int AS min_tat_days,
+                   max(actual_delivered_at::date - booking_date)::int AS max_tat_days,
+                   percentile_cont(0.75) WITHIN GROUP (
+                       ORDER BY (actual_delivered_at::date - booking_date)
+                   ) AS p75_tat_days,
+                   percentile_cont(0.9) WITHIN GROUP (
+                       ORDER BY (actual_delivered_at::date - booking_date)
+                   ) AS p90_tat_days,
+                   count(*) FILTER (
+                       WHERE planned_delivery_at IS NOT NULL
+                         AND actual_delivered_at <= planned_delivery_at
+                   )::int AS on_time_deliveries,
+                   count(*) FILTER (
+                       WHERE planned_delivery_at IS NOT NULL
+                   )::int AS planned_count
+            FROM deal_facts
+            WHERE actual_delivered_at IS NOT NULL
+              AND booking_date IS NOT NULL
+              AND actual_delivered_at::date >= booking_date
+            GROUP BY dealer_name, outlet_name
+            ORDER BY deliveries_completed DESC, dealer_name, outlet_name
+            """,
+        )
+        for row in by_outlet:
+            row["on_time_pct"] = _rate(
+                row.get("on_time_deliveries") or 0,
+                row.get("planned_count") or 0,
+            )
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "by_month": by_month,
+        "by_model": by_model,
+        "by_outlet": by_outlet,
+        "tat_definition": "Booking date to actual delivery date in calendar days.",
+    }
+
+
+@router.get("/discount-waterfall")
+def discount_waterfall(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Discount breakdown by type across models and outlets.
+
+    Each discount key is shown as standard-eligible vs actual-given,
+    enabling a per-type standard-vs-actual waterfall.
+    """
+    connection, latest = _latest_context(tenant_id)
+    try:
+        # per-key totals across all journeys
+        by_key = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            SELECT COALESCE(row_data->>'discount_key','UNSPECIFIED') AS discount_key,
+                   count(DISTINCT row_data->>'journey_id')::int AS journey_count,
+                   COALESCE(sum(NULLIF(row_data->>'standard_eligible_amount','')::numeric),0)
+                       AS standard_eligible,
+                   COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric),0)
+                       AS actual_given,
+                   COALESCE(sum(
+                       GREATEST(
+                           NULLIF(row_data->>'actual_discount_amount','')::numeric
+                           - NULLIF(row_data->>'standard_eligible_amount','')::numeric,
+                           0
+                       )
+                   ) FILTER (
+                       WHERE NULLIF(row_data->>'actual_discount_amount','') IS NOT NULL
+                         AND NULLIF(row_data->>'standard_eligible_amount','') IS NOT NULL
+                   ),0) AS above_eligible,
+                   count(*) FILTER (
+                       WHERE NULLIF(row_data->>'actual_discount_amount','')::numeric IS NOT NULL
+                         AND NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
+                         AND NULLIF(row_data->>'actual_discount_amount','')::numeric
+                             > NULLIF(row_data->>'standard_eligible_amount','')::numeric
+                   )::int AS excess_count
+            FROM analytics.snapshot_rows
+            WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+              AND source_table='discount_applications'
+            GROUP BY 1
+            ORDER BY actual_given DESC, discount_key
+            """,
+        )
+        # waterfall per model
+        by_model = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT COALESCE(model_name,'Unresolved') AS model_name,
+                   count(*)::int AS journeys,
+                   COALESCE(sum(dk_cash_discount),0) AS cash_discount,
+                   COALESCE(sum(dk_exchange_bonus),0) AS exchange_bonus,
+                   COALESCE(sum(dk_scrappage),0) AS scrappage,
+                   COALESCE(sum(dk_corporate),0) AS corporate,
+                   COALESCE(sum(dk_loyalty),0) AS loyalty,
+                   COALESCE(sum(dk_insurance),0) AS insurance_discount,
+                   COALESCE(sum(dk_mr),0) AS management_referral,
+                   COALESCE(sum(dk_scheme_benefit),0) AS scheme_benefit,
+                   COALESCE(sum(dk_other),0) AS other,
+                   COALESCE(sum(actual_discount_amount),0) AS total_actual_discount,
+                   COALESCE(sum(eligible_discount_amount),0) AS total_eligible_discount,
+                   count(*) FILTER (WHERE has_mr_discount)::int AS mr_journeys,
+                   count(*) FILTER (WHERE has_excess_on_any_key)::int AS excess_journeys
+            FROM deal_facts
+            GROUP BY 1
+            ORDER BY total_actual_discount DESC, model_name
+            """,
+        )
+        # waterfall per outlet
+        by_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT dealer_name, outlet_name,
+                   count(*)::int AS journeys,
+                   COALESCE(sum(dk_cash_discount),0) AS cash_discount,
+                   COALESCE(sum(dk_exchange_bonus),0) AS exchange_bonus,
+                   COALESCE(sum(dk_scrappage),0) AS scrappage,
+                   COALESCE(sum(dk_corporate),0) AS corporate,
+                   COALESCE(sum(dk_loyalty),0) AS loyalty,
+                   COALESCE(sum(dk_insurance),0) AS insurance_discount,
+                   COALESCE(sum(dk_mr),0) AS management_referral,
+                   COALESCE(sum(dk_scheme_benefit),0) AS scheme_benefit,
+                   COALESCE(sum(dk_other),0) AS other,
+                   COALESCE(sum(actual_discount_amount),0) AS total_actual_discount,
+                   COALESCE(sum(eligible_discount_amount),0) AS total_eligible_discount,
+                   count(*) FILTER (WHERE has_mr_discount)::int AS mr_journeys,
+                   count(*) FILTER (WHERE has_excess_on_any_key)::int AS excess_journeys
+            FROM deal_facts
+            GROUP BY dealer_name, outlet_name
+            ORDER BY total_actual_discount DESC, dealer_name, outlet_name
+            """,
+        )
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "by_key": by_key,
+        "by_model": by_model,
+        "by_outlet": by_outlet,
+        "note": (
+            "management_referral is TL-authorised; it has no OEM-standard ceiling. "
+            "above_eligible is computed only where both actual and eligible are populated."
+        ),
+    }
+
+
+@router.get("/management-referral")
+def management_referral(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Management Referral (MR) discount summary — TL-granted exception discounts."""
+    connection, latest = _latest_context(tenant_id)
+    try:
+        summary = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                """
+                SELECT count(*)::int AS total_journeys_with_mr_record,
+                       count(*) FILTER (WHERE (NULLIF(row_data->>'opted','')::boolean) IS TRUE)::int
+                           AS opted_count,
+                       COALESCE(sum(NULLIF(row_data->>'amount','')::numeric) FILTER (
+                           WHERE (NULLIF(row_data->>'opted','')::boolean) IS TRUE
+                       ),0) AS total_mr_amount,
+                       round(avg(NULLIF(row_data->>'amount','')::numeric) FILTER (
+                           WHERE (NULLIF(row_data->>'opted','')::boolean) IS TRUE
+                       ),2) AS avg_mr_amount
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                  AND source_table='p2_management_referrals'
+                """,
+            )
+        )
+        by_role = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            SELECT COALESCE(NULLIF(row_data->>'set_by_role',''),'UNSPECIFIED') AS set_by_role,
+                   count(*) FILTER (WHERE (NULLIF(row_data->>'opted','')::boolean) IS TRUE)::int
+                       AS opted_count,
+                   COALESCE(sum(NULLIF(row_data->>'amount','')::numeric) FILTER (
+                       WHERE (NULLIF(row_data->>'opted','')::boolean) IS TRUE
+                   ),0) AS total_amount,
+                   round(avg(NULLIF(row_data->>'amount','')::numeric) FILTER (
+                       WHERE (NULLIF(row_data->>'opted','')::boolean) IS TRUE
+                   ),2) AS avg_amount
+            FROM analytics.snapshot_rows
+            WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+              AND source_table='p2_management_referrals'
+            GROUP BY 1
+            ORDER BY total_amount DESC, set_by_role
+            """,
+        )
+        by_model = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT COALESCE(model_name,'Unresolved') AS model_name,
+                   count(*) FILTER (WHERE has_mr_discount)::int AS mr_opted_journeys,
+                   COALESCE(sum(dk_mr) FILTER (WHERE has_mr_discount),0) AS total_mr_amount,
+                   round(avg(dk_mr) FILTER (WHERE has_mr_discount),2) AS avg_mr_amount,
+                   count(*)::int AS total_journeys
+            FROM deal_facts
+            GROUP BY 1
+            HAVING count(*) FILTER (WHERE has_mr_discount) > 0
+            ORDER BY total_mr_amount DESC, model_name
+            """,
+        )
+        for row in by_model:
+            row["mr_penetration_pct"] = _rate(
+                row.get("mr_opted_journeys") or 0,
+                row.get("total_journeys") or 0,
+            )
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "summary": summary,
+        "by_role": by_role,
+        "by_model": by_model,
+        "note": (
+            "Management Referral discount is TL-authorised with no OEM standard ceiling. "
+            "opted=false records are journeys where the MR task was raised but not opted in."
+        ),
+    }
+
+
+@router.get("/compliance-families")
+def compliance_families(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Audit findings grouped into rule families for risk-category dashboards."""
+    connection, latest = _latest_context(tenant_id)
+    try:
+        by_family = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            SELECT
+                CASE
+                    WHEN row_data->>'rule_key' IN ('EXCESS_DISCOUNT','DEAL_UNDERCHARGED')
+                        THEN 'DISCOUNT_COMPLIANCE'
+                    WHEN row_data->>'rule_key' IN ('TCS_SHORT','CASH_ABOVE_LIMIT')
+                        THEN 'STATUTORY'
+                    WHEN row_data->>'rule_key' IN (
+                        'DELIVERED_ON_SHORT_PAYMENT',
+                        'PAYMENT_AFTER_DELIVERY_WITHIN_GRACE',
+                        'PAYMENT_AFTER_DELIVERY_BEYOND_GRACE',
+                        'POST_DELIVERY_REFUND'
+                    ) THEN 'SETTLEMENT'
+                    WHEN row_data->>'rule_key' IN ('DO_PAYMENT_NOT_RECEIVED','DO_SHORT_PAYMENT')
+                        THEN 'FINANCE'
+                    WHEN row_data->>'rule_key' IN ('TRADE_IN_NOT_RESOLD','TRADE_IN_SOLD_AT_LOSS')
+                        THEN 'TRADE_IN'
+                    WHEN row_data->>'rule_key' IN (
+                        'DELIVERY_NOT_COMPLETED_IN_TIME','NDC_NOT_SIGNED','NDC_SIGNATURE_UNCONFIRMED'
+                    ) THEN 'PROCESS'
+                    WHEN row_data->>'rule_key' IN (
+                        'THIRD_PARTY_PAYMENT_UNDECLARED','THIRD_PARTY_PAYMENT_UNCONFIRMED',
+                        'CASH_NOT_INTIMATED','CASH_INTIMATION_UNCONFIRMED'
+                    ) THEN 'CASH_AML'
+                    WHEN row_data->>'rule_key' IN (
+                        'ACCESSORY_FITTED_UNBILLED','ACCESSORIES_FITTED_UNCONFIRMED'
+                    ) THEN 'ACCESSORIES'
+                    WHEN lower(COALESCE(row_data->>'rule_key','')) LIKE '%document%'
+                        THEN 'DOCUMENT'
+                    ELSE 'OTHER'
+                END AS rule_family,
+                COALESCE(row_data->>'finding_status','UNSPECIFIED') AS finding_status,
+                count(*)::int AS finding_count,
+                count(DISTINCT row_data->>'journey_id')::int AS journey_count
+            FROM analytics.snapshot_rows
+            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='audit_findings'
+            GROUP BY 1,2
+            ORDER BY finding_count DESC, rule_family, finding_status
+            """,
+        )
+        by_family_open = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            SELECT
+                CASE
+                    WHEN row_data->>'rule_key' IN ('EXCESS_DISCOUNT','DEAL_UNDERCHARGED')
+                        THEN 'DISCOUNT_COMPLIANCE'
+                    WHEN row_data->>'rule_key' IN ('TCS_SHORT','CASH_ABOVE_LIMIT')
+                        THEN 'STATUTORY'
+                    WHEN row_data->>'rule_key' IN (
+                        'DELIVERED_ON_SHORT_PAYMENT',
+                        'PAYMENT_AFTER_DELIVERY_WITHIN_GRACE',
+                        'PAYMENT_AFTER_DELIVERY_BEYOND_GRACE',
+                        'POST_DELIVERY_REFUND'
+                    ) THEN 'SETTLEMENT'
+                    WHEN row_data->>'rule_key' IN ('DO_PAYMENT_NOT_RECEIVED','DO_SHORT_PAYMENT')
+                        THEN 'FINANCE'
+                    WHEN row_data->>'rule_key' IN ('TRADE_IN_NOT_RESOLD','TRADE_IN_SOLD_AT_LOSS')
+                        THEN 'TRADE_IN'
+                    WHEN row_data->>'rule_key' IN (
+                        'DELIVERY_NOT_COMPLETED_IN_TIME','NDC_NOT_SIGNED','NDC_SIGNATURE_UNCONFIRMED'
+                    ) THEN 'PROCESS'
+                    WHEN row_data->>'rule_key' IN (
+                        'THIRD_PARTY_PAYMENT_UNDECLARED','THIRD_PARTY_PAYMENT_UNCONFIRMED',
+                        'CASH_NOT_INTIMATED','CASH_INTIMATION_UNCONFIRMED'
+                    ) THEN 'CASH_AML'
+                    WHEN row_data->>'rule_key' IN (
+                        'ACCESSORY_FITTED_UNBILLED','ACCESSORIES_FITTED_UNCONFIRMED'
+                    ) THEN 'ACCESSORIES'
+                    WHEN lower(COALESCE(row_data->>'rule_key','')) LIKE '%document%'
+                        THEN 'DOCUMENT'
+                    ELSE 'OTHER'
+                END AS rule_family,
+                count(*)::int AS open_finding_count,
+                count(DISTINCT row_data->>'journey_id')::int AS journey_count
+            FROM analytics.snapshot_rows
+            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='audit_findings'
+              AND upper(COALESCE(row_data->>'finding_status','')) = 'OPEN'
+            GROUP BY 1
+            ORDER BY open_finding_count DESC, rule_family
+            """,
+        )
+        statutory_detail = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            SELECT COALESCE(row_data->>'rule_key','UNSPECIFIED') AS rule_key,
+                   COALESCE(row_data->>'finding_status','UNSPECIFIED') AS finding_status,
+                   COALESCE(row_data->>'severity','UNSPECIFIED') AS severity,
+                   count(*)::int AS finding_count,
+                   count(DISTINCT row_data->>'journey_id')::int AS journey_count
+            FROM analytics.snapshot_rows
+            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='audit_findings'
+              AND row_data->>'rule_key' IN ('TCS_SHORT','CASH_ABOVE_LIMIT')
+            GROUP BY 1,2,3
+            ORDER BY finding_count DESC, rule_key
+            """,
+        )
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "by_family": by_family,
+        "by_family_open": by_family_open,
+        "statutory_detail": statutory_detail,
+        "families": {
+            "DISCOUNT_COMPLIANCE": "EXCESS_DISCOUNT, DEAL_UNDERCHARGED",
+            "STATUTORY": "TCS_SHORT, CASH_ABOVE_LIMIT",
+            "SETTLEMENT": "DELIVERED_ON_SHORT_PAYMENT, PAYMENT_AFTER_DELIVERY_*",
+            "FINANCE": "DO_PAYMENT_NOT_RECEIVED, DO_SHORT_PAYMENT",
+            "TRADE_IN": "TRADE_IN_NOT_RESOLD, TRADE_IN_SOLD_AT_LOSS",
+            "PROCESS": "DELIVERY_NOT_COMPLETED_IN_TIME, NDC_NOT_SIGNED",
+            "CASH_AML": "THIRD_PARTY_PAYMENT_*, CASH_INTIMATION_*",
+            "ACCESSORIES": "ACCESSORY_FITTED_UNBILLED, ACCESSORIES_FITTED_UNCONFIRMED",
+            "DOCUMENT": "All rule keys containing 'document'",
+        },
+    }
+
+
+@router.get("/trade-in-health")
+def trade_in_health(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Trade-in valuation accuracy and resale timeline health."""
+    connection, latest = _latest_context(tenant_id)
+    try:
+        summary = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                _DEAL_FACTS_CTE
+                + """
+                SELECT count(*) FILTER (WHERE has_trade_in)::int AS trade_in_journeys,
+                       count(*) FILTER (
+                           WHERE has_trade_in AND trade_in_actual_value IS NOT NULL
+                             AND trade_in_quoted_value IS NOT NULL
+                       )::int AS valued_and_quoted,
+                       count(*) FILTER (
+                           WHERE has_trade_in
+                             AND trade_in_actual_value IS NOT NULL
+                             AND trade_in_quoted_value IS NOT NULL
+                             AND trade_in_actual_value < trade_in_quoted_value
+                       )::int AS sold_below_valuation,
+                       COALESCE(sum(trade_in_quoted_value) FILTER (WHERE has_trade_in),0)
+                           AS total_quoted_value,
+                       COALESCE(sum(trade_in_actual_value) FILTER (WHERE has_trade_in),0)
+                           AS total_actual_value,
+                       round(avg(trade_in_quoted_value) FILTER (WHERE has_trade_in),2)
+                           AS avg_quoted_value,
+                       round(avg(trade_in_actual_value) FILTER (WHERE has_trade_in),2)
+                           AS avg_actual_value,
+                       count(*) FILTER (
+                           WHERE has_trade_in AND trade_in_resale_at IS NOT NULL
+                       )::int AS resold_count,
+                       round(avg(
+                           EXTRACT(EPOCH FROM (trade_in_resale_at - trade_in_handover_at)) / 86400.0
+                       ) FILTER (
+                           WHERE has_trade_in
+                             AND trade_in_resale_at IS NOT NULL
+                             AND trade_in_handover_at IS NOT NULL
+                       ),2) AS avg_resale_days,
+                       percentile_cont(0.9) WITHIN GROUP (
+                           ORDER BY EXTRACT(EPOCH FROM (trade_in_resale_at - trade_in_handover_at)) / 86400.0
+                       ) FILTER (
+                           WHERE has_trade_in
+                             AND trade_in_resale_at IS NOT NULL
+                             AND trade_in_handover_at IS NOT NULL
+                       ) AS p90_resale_days
+                FROM deal_facts
+                """,
+            )
+        )
+        valued_and_quoted = int(summary.get("valued_and_quoted") or 0)
+        summary["sold_below_valuation_pct"] = _rate(
+            summary.get("sold_below_valuation") or 0, valued_and_quoted
+        )
+        by_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT dealer_name, outlet_name,
+                   count(*) FILTER (WHERE has_trade_in)::int AS trade_in_journeys,
+                   COALESCE(sum(trade_in_quoted_value) FILTER (WHERE has_trade_in),0)
+                       AS total_quoted_value,
+                   COALESCE(sum(trade_in_actual_value) FILTER (WHERE has_trade_in),0)
+                       AS total_actual_value,
+                   count(*) FILTER (
+                       WHERE has_trade_in
+                         AND trade_in_actual_value IS NOT NULL
+                         AND trade_in_quoted_value IS NOT NULL
+                         AND trade_in_actual_value < trade_in_quoted_value
+                   )::int AS sold_below_valuation,
+                   round(avg(
+                       EXTRACT(EPOCH FROM (trade_in_resale_at - trade_in_handover_at)) / 86400.0
+                   ) FILTER (
+                       WHERE has_trade_in
+                         AND trade_in_resale_at IS NOT NULL
+                         AND trade_in_handover_at IS NOT NULL
+                   ),2) AS avg_resale_days
+            FROM deal_facts
+            WHERE has_trade_in
+            GROUP BY dealer_name, outlet_name
+            ORDER BY trade_in_journeys DESC, dealer_name, outlet_name
+            """,
+        )
+        pending_resale = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT journey_id, dealer_name, outlet_name, model_name,
+                   trade_in_handover_at,
+                   (CURRENT_DATE - trade_in_handover_at::date)::int AS days_since_handover
+            FROM deal_facts
+            WHERE has_trade_in
+              AND trade_in_handover_at IS NOT NULL
+              AND trade_in_resale_at IS NULL
+            ORDER BY days_since_handover DESC NULLS LAST
+            LIMIT 50
+            """,
+        )
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "summary": summary,
+        "by_outlet": by_outlet,
+        "pending_resale": pending_resale,
+        "note": (
+            "sold_below_valuation: trade-in vehicles where the actual resale value was less than "
+            "the quoted valuation. pending_resale: top 50 vehicles handed over but not yet resold."
+        ),
+    }
+
+
+@router.get("/insurance-source")
+def insurance_source_split(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Insurance split by source (INHOUSE vs SELF) with correct penetration metrics."""
+    connection, latest = _latest_context(tenant_id)
+    try:
+        summary = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                _DEAL_FACTS_CTE
+                + """
+                SELECT count(*)::int AS journeys,
+                       count(*) FILTER (WHERE has_insurance)::int AS insurance_journeys,
+                       count(*) FILTER (WHERE has_inhouse_insurance)::int AS inhouse_journeys,
+                       count(*) FILTER (
+                           WHERE has_insurance AND insurance_source = 'SELF'
+                       )::int AS self_journeys,
+                       count(*) FILTER (
+                           WHERE has_insurance AND insurance_source IS NULL
+                       )::int AS source_unknown_journeys,
+                       COALESCE(sum(actual_premium_amount) FILTER (
+                           WHERE has_inhouse_insurance
+                       ),0) AS inhouse_premium_total,
+                       round(avg(actual_premium_amount) FILTER (
+                           WHERE has_inhouse_insurance AND actual_premium_amount IS NOT NULL
+                       ),2) AS avg_inhouse_premium
+                FROM deal_facts
+                """,
+            )
+        )
+        total = int(summary.get("journeys") or 0)
+        summary["inhouse_penetration_pct"] = _rate(
+            summary.get("inhouse_journeys") or 0, total
+        )
+        summary["self_penetration_pct"] = _rate(
+            summary.get("self_journeys") or 0, total
+        )
+        by_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT dealer_name, outlet_name,
+                   count(*)::int AS journeys,
+                   count(*) FILTER (WHERE has_inhouse_insurance)::int AS inhouse_journeys,
+                   count(*) FILTER (
+                       WHERE has_insurance AND insurance_source = 'SELF'
+                   )::int AS self_journeys,
+                   COALESCE(sum(actual_premium_amount) FILTER (
+                       WHERE has_inhouse_insurance
+                   ),0) AS inhouse_premium_total
+            FROM deal_facts
+            GROUP BY dealer_name, outlet_name
+            ORDER BY inhouse_journeys DESC, dealer_name, outlet_name
+            """,
+        )
+        for row in by_outlet:
+            journeys = int(row.get("journeys") or 0)
+            row["inhouse_penetration_pct"] = _rate(
+                row.get("inhouse_journeys") or 0, journeys
+            )
+            row["self_penetration_pct"] = _rate(
+                row.get("self_journeys") or 0, journeys
+            )
+        by_insurer_inhouse = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT COALESCE(insurer_name,'Unspecified') AS insurer_name,
+                   count(*) FILTER (WHERE has_inhouse_insurance)::int AS policy_count,
+                   COALESCE(sum(actual_premium_amount) FILTER (
+                       WHERE has_inhouse_insurance
+                   ),0) AS premium_total,
+                   round(avg(actual_premium_amount) FILTER (
+                       WHERE has_inhouse_insurance AND actual_premium_amount IS NOT NULL
+                   ),2) AS avg_premium
+            FROM deal_facts
+            WHERE has_inhouse_insurance
+            GROUP BY 1
+            ORDER BY policy_count DESC, insurer_name
+            """,
+        )
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "summary": summary,
+        "by_outlet": by_outlet,
+        "by_insurer_inhouse": by_insurer_inhouse,
+        "note": (
+            "inhouse_penetration_pct counts only INHOUSE-sourced insurance as dealer revenue. "
+            "SELF-sourced insurance is customer-arranged and excluded from dealer penetration. "
+            "Journeys where insurance_source is NULL are treated as INHOUSE (legacy default)."
+        ),
+    }
+
+
+@router.get("/dealer-discount-grid")
+def dealer_discount_grid(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Dealer discount grid policy per model — buffer, OD cap, booking protection, out-of-territory.
+
+    Combines the grid master with actual discount_applications to show how much
+    of the agreed buffer has been consumed per model.
+    """
+    connection, latest = _latest_context(tenant_id)
+    try:
+        # Grid rows: one row per model from the latest PUBLISHED grid version
+        grid_rows = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            WITH ranked_versions AS (
+                SELECT row_data->>'grid_version_id' AS grid_version_id,
+                       row_data->>'effective_from' AS effective_from,
+                       row_data->>'lifecycle_status' AS lifecycle_status,
+                       row_number() OVER (
+                           PARTITION BY row_data->>'tenant_id'
+                           ORDER BY (row_data->>'effective_from') DESC NULLS LAST
+                       ) AS rn
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                  AND source_table='dealer_discount_grid_versions'
+                  AND row_data->>'lifecycle_status' = 'PUBLISHED'
+            ),
+            latest_version AS (
+                SELECT grid_version_id, effective_from
+                FROM ranked_versions WHERE rn = 1
+            )
+            SELECT gr.row_data->>'model_alias' AS model_alias,
+                   NULLIF(gr.row_data->>'booking_protection_days','')::int
+                       AS booking_protection_days,
+                   NULLIF(gr.row_data->>'agreed_buffer_amount','')::numeric
+                       AS agreed_buffer_amount,
+                   NULLIF(gr.row_data->>'insurance_od_percent','')::numeric
+                       AS insurance_od_percent,
+                   NULLIF(gr.row_data->>'out_of_territory_amount','')::numeric
+                       AS out_of_territory_amount,
+                   lv.effective_from AS grid_effective_from
+            FROM analytics.snapshot_rows gr
+            JOIN latest_version lv
+              ON gr.row_data->>'grid_version_id' = lv.grid_version_id
+            WHERE gr.tenant_id=:tenant_id AND gr.dump_id=:dump_id
+              AND gr.source_table='dealer_discount_grid_rows'
+              AND (gr.row_data->>'in_scope')::boolean IS NOT FALSE
+            ORDER BY gr.row_data->>'model_alias'
+            """,
+        )
+
+        # Buffer utilisation: actual MR + OTHER discount consumed vs agreed_buffer per model
+        # Uses journey_products to link model_name to grid model_alias (best-effort text match)
+        buffer_utilisation = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            , grid AS (
+                SELECT gr.row_data->>'model_alias' AS model_alias,
+                       NULLIF(gr.row_data->>'agreed_buffer_amount','')::numeric
+                           AS agreed_buffer_amount,
+                       NULLIF(gr.row_data->>'insurance_od_percent','')::numeric
+                           AS insurance_od_percent_max
+                FROM analytics.snapshot_rows gr
+                WHERE gr.tenant_id=:tenant_id AND gr.dump_id=:dump_id
+                  AND gr.source_table='dealer_discount_grid_rows'
+                  AND (gr.row_data->>'in_scope')::boolean IS NOT FALSE
+            )
+            SELECT df.model_name,
+                   g.model_alias,
+                   g.agreed_buffer_amount,
+                   g.insurance_od_percent_max,
+                   count(*) FILTER (WHERE df.has_mr_discount OR df.dk_other > 0)::int
+                       AS journeys_with_buffer_discount,
+                   COALESCE(sum(df.dk_mr + df.dk_other),0) AS total_buffer_consumed,
+                   round(avg(df.dk_mr + df.dk_other) FILTER (
+                       WHERE df.has_mr_discount OR df.dk_other > 0
+                   ),2) AS avg_buffer_per_journey,
+                   round(
+                       CASE WHEN g.agreed_buffer_amount > 0
+                            THEN (COALESCE(sum(df.dk_mr + df.dk_other),0) /
+                                  (count(*) * g.agreed_buffer_amount)) * 100.0
+                            ELSE NULL END
+                   ,1) AS avg_buffer_utilisation_pct
+            FROM deal_facts df
+            LEFT JOIN grid g
+              ON lower(trim(g.model_alias)) = lower(trim(COALESCE(df.model_name,'')))
+            WHERE df.model_name IS NOT NULL
+            GROUP BY df.model_name, g.model_alias, g.agreed_buffer_amount,
+                     g.insurance_od_percent_max
+            ORDER BY total_buffer_consumed DESC, df.model_name
+            """,
+        )
+
+        # Models in grid but with no journey data yet (new models configured but not booked)
+        grid_model_aliases = {r["model_alias"] for r in grid_rows if r.get("model_alias")}
+        utilisation_models = {r["model_name"] for r in buffer_utilisation if r.get("model_name")}
+        unmatched_grid_models = sorted(grid_model_aliases - utilisation_models)
+
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "grid_rows": grid_rows,
+        "buffer_utilisation": buffer_utilisation,
+        "unmatched_grid_models": unmatched_grid_models,
+        "note": (
+            "buffer_utilisation combines Management Referral (dk_mr) and Other Scheme (dk_other) "
+            "as the two discount types that consume the agreed dealer buffer per model. "
+            "Model matching is case-insensitive text match between grid model_alias and "
+            "journey model_name — use the unmatched_grid_models list to identify alias mismatches."
         ),
     }

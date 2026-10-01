@@ -56,7 +56,8 @@ finance AS (
     GROUP BY 1
 ),
 insurance AS (
-    SELECT row_data->>'journey_id' AS journey_id
+    SELECT row_data->>'journey_id' AS journey_id,
+           bool_or(COALESCE(NULLIF(row_data->>'insurance_source',''),'INHOUSE') = 'INHOUSE') AS has_inhouse
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
     GROUP BY 1
@@ -75,6 +76,13 @@ addons AS (
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journey_addons'
     GROUP BY 1
+),
+mr_discount AS (
+    SELECT row_data->>'journey_id' AS journey_id,
+           (NULLIF(row_data->>'opted','')::boolean) AS mr_opted,
+           NULLIF(row_data->>'amount','')::numeric AS mr_amount
+    FROM analytics.snapshot_rows
+    WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='p2_management_referrals'
 ),
 bookings AS (
     SELECT row_data->>'journey_id' AS journey_id,
@@ -110,6 +118,7 @@ journey_metrics AS (
            (COALESCE(f.missing_document_flag_count,0) > 0) AS has_missing_documents,
            (fin.journey_id IS NOT NULL) AS has_finance,
            (ins.journey_id IS NOT NULL) AS has_insurance,
+           (ins.journey_id IS NOT NULL AND COALESCE(ins.has_inhouse, true)) AS has_inhouse_insurance,
            (tr.journey_id IS NOT NULL) AS has_trade_in,
            COALESCE(a.has_ew,false) AS has_ew,
            COALESCE(a.has_rsa,false) AS has_rsa,
@@ -119,7 +128,9 @@ journey_metrics AS (
            COALESCE(b.exchange_discount,false) AS has_exchange_discount,
            COALESCE(p.payment_amount,0) AS payment_amount,
            COALESCE(d.actual_discount_amount,0) AS actual_discount_amount,
-           COALESCE(d.eligible_discount_amount,0) AS eligible_discount_amount
+           COALESCE(d.eligible_discount_amount,0) AS eligible_discount_amount,
+           COALESCE(mr.mr_opted IS TRUE, false) AS has_mr_discount,
+           COALESCE(mr.mr_amount, 0) AS mr_amount
     FROM journeys j
     LEFT JOIN findings f USING (journey_id)
     LEFT JOIN finance fin USING (journey_id)
@@ -129,6 +140,7 @@ journey_metrics AS (
     LEFT JOIN bookings b USING (journey_id)
     LEFT JOIN payments p USING (journey_id)
     LEFT JOIN discounts d USING (journey_id)
+    LEFT JOIN mr_discount mr USING (journey_id)
 ),
 dealer_rows AS (
     SELECT 'DEALER'::text AS scope_level,
@@ -147,6 +159,7 @@ dealer_rows AS (
            count(jm.journey_id) FILTER (WHERE jm.has_missing_documents)::int AS journeys_with_missing_documents,
            count(jm.journey_id) FILTER (WHERE jm.has_finance)::int AS finance_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_insurance)::int AS insurance_journeys,
+           count(jm.journey_id) FILTER (WHERE jm.has_inhouse_insurance)::int AS inhouse_insurance_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_trade_in)::int AS trade_in_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_ew)::int AS ew_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_rsa)::int AS rsa_journeys,
@@ -154,9 +167,11 @@ dealer_rows AS (
            count(jm.journey_id) FILTER (WHERE jm.has_corporate_discount)::int AS corporate_discount_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_gst_benefit)::int AS gst_benefit_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_exchange_discount)::int AS exchange_discount_journeys,
+           count(jm.journey_id) FILTER (WHERE jm.has_mr_discount)::int AS mr_discount_journeys,
            COALESCE(sum(jm.payment_amount),0) AS payment_amount,
            COALESCE(sum(jm.actual_discount_amount),0) AS actual_discount_amount,
-           COALESCE(sum(jm.eligible_discount_amount),0) AS eligible_discount_amount
+           COALESCE(sum(jm.eligible_discount_amount),0) AS eligible_discount_amount,
+           COALESCE(sum(jm.mr_amount),0) AS mr_discount_amount
     FROM configured_dealers d
     LEFT JOIN journey_metrics jm ON jm.dealer_id=d.dealer_id
     GROUP BY d.dealer_id,d.dealer_name
@@ -178,6 +193,7 @@ outlet_rows AS (
            count(jm.journey_id) FILTER (WHERE jm.has_missing_documents)::int AS journeys_with_missing_documents,
            count(jm.journey_id) FILTER (WHERE jm.has_finance)::int AS finance_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_insurance)::int AS insurance_journeys,
+           count(jm.journey_id) FILTER (WHERE jm.has_inhouse_insurance)::int AS inhouse_insurance_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_trade_in)::int AS trade_in_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_ew)::int AS ew_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_rsa)::int AS rsa_journeys,
@@ -185,9 +201,11 @@ outlet_rows AS (
            count(jm.journey_id) FILTER (WHERE jm.has_corporate_discount)::int AS corporate_discount_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_gst_benefit)::int AS gst_benefit_journeys,
            count(jm.journey_id) FILTER (WHERE jm.has_exchange_discount)::int AS exchange_discount_journeys,
+           count(jm.journey_id) FILTER (WHERE jm.has_mr_discount)::int AS mr_discount_journeys,
            COALESCE(sum(jm.payment_amount),0) AS payment_amount,
            COALESCE(sum(jm.actual_discount_amount),0) AS actual_discount_amount,
-           COALESCE(sum(jm.eligible_discount_amount),0) AS eligible_discount_amount
+           COALESCE(sum(jm.eligible_discount_amount),0) AS eligible_discount_amount,
+           COALESCE(sum(jm.mr_amount),0) AS mr_discount_amount
     FROM configured_outlets o
     LEFT JOIN configured_dealers d ON d.dealer_id=o.dealer_id
     LEFT JOIN journey_metrics jm ON jm.outlet_id=o.outlet_id
@@ -210,6 +228,7 @@ _COUNT_FIELDS = (
     "journeys_with_missing_documents",
     "finance_journeys",
     "insurance_journeys",
+    "inhouse_insurance_journeys",
     "trade_in_journeys",
     "ew_journeys",
     "rsa_journeys",
@@ -217,9 +236,15 @@ _COUNT_FIELDS = (
     "corporate_discount_journeys",
     "gst_benefit_journeys",
     "exchange_discount_journeys",
+    "mr_discount_journeys",
 )
 
-_AMOUNT_FIELDS = ("payment_amount", "actual_discount_amount", "eligible_discount_amount")
+_AMOUNT_FIELDS = (
+    "payment_amount",
+    "actual_discount_amount",
+    "eligible_discount_amount",
+    "mr_discount_amount",
+)
 
 
 def _rate(part: int, whole: int) -> float:
@@ -247,6 +272,8 @@ def _enrich(row: dict) -> dict:
             "corporate_discount_penetration_pct": _rate(result["corporate_discount_journeys"], journeys),
             "gst_benefit_penetration_pct": _rate(result["gst_benefit_journeys"], journeys),
             "exchange_discount_penetration_pct": _rate(result["exchange_discount_journeys"], journeys),
+            "inhouse_insurance_penetration_pct": _rate(result["inhouse_insurance_journeys"], journeys),
+            "mr_discount_penetration_pct": _rate(result["mr_discount_journeys"], journeys),
         }
     )
     return result
@@ -280,6 +307,8 @@ def _project_summary(dealers: list[dict], outlets: list[dict]) -> dict:
         "corporate_discount_penetration_pct": _rate(totals["corporate_discount_journeys"], journeys),
         "gst_benefit_penetration_pct": _rate(totals["gst_benefit_journeys"], journeys),
         "exchange_discount_penetration_pct": _rate(totals["exchange_discount_journeys"], journeys),
+        "inhouse_insurance_penetration_pct": _rate(totals["inhouse_insurance_journeys"], journeys),
+        "mr_discount_penetration_pct": _rate(totals["mr_discount_journeys"], journeys),
     }
 
 
