@@ -51,6 +51,11 @@ SOURCE_TABLES: tuple[SourceTable, ...] = (
     SourceTable("customer_identity_index", "identity_index_id"),
     SourceTable("crm_interactions", "crm_interaction_id"),
     SourceTable("escalations", "escalation_id"),
+    # Phase-2 additions — migration 0137 (dealer discount grid)
+    SourceTable("dealer_discount_grid_versions", "grid_version_id"),
+    SourceTable("dealer_discount_grid_rows", "grid_row_id"),
+    # Phase-2 additions — migration 0138 (management-referral discount)
+    SourceTable("p2_management_referrals", "journey_id"),
 )
 
 
@@ -156,7 +161,7 @@ def _copy_derived_customer_geography(
                    field_key,
                    (regexp_match(
                        normalized_value,
-                       '(^|[^0-9])([1-9][0-9]{{5}})([^0-9]|$)'
+                       '(^|[^0-9])([1-9][0-9]{{{{5}}}})([^0-9]|$)'
                    ))[2] AS customer_pincode
             FROM {schema}.evidence_facts
             WHERE tenant_id = :tenant_id

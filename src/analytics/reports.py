@@ -99,13 +99,27 @@ def payments(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_r
         latest = _latest_dump(connection, tenant_id)
         rows = _query_rows(connection, """
             SELECT COALESCE(row_data->>'payment_method_code','UNSPECIFIED') AS payment_method,
+                   COALESCE(NULLIF(row_data->>'payment_stage',''),'UNSPECIFIED') AS payment_stage,
                    count(*)::int AS payment_count,
                    COALESCE(sum(NULLIF(row_data->>'amount','')::numeric),0) AS total_amount
             FROM analytics.snapshot_rows
             WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='payments'
-            GROUP BY 1 ORDER BY total_amount DESC, payment_method
+            GROUP BY 1,2 ORDER BY total_amount DESC, payment_method, payment_stage
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
-    return {"tenant_id": tenant_id, "data_as_of": latest["data_as_of_utc"], "rows": rows}
+        stage_split = _query_rows(connection, """
+            SELECT COALESCE(NULLIF(row_data->>'payment_stage',''),'UNSPECIFIED') AS payment_stage,
+                   count(*)::int AS payment_count,
+                   COALESCE(sum(NULLIF(row_data->>'amount','')::numeric),0) AS total_amount
+            FROM analytics.snapshot_rows
+            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='payments'
+            GROUP BY 1 ORDER BY total_amount DESC
+            """, tenant_id=tenant_id, dump_id=latest["dump_id"])
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "rows": rows,
+        "stage_split": stage_split,
+    }
 
 
 @router.get("/finance")
@@ -131,11 +145,20 @@ def insurance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_
         rows = _query_rows(connection, """
             SELECT COALESCE(row_data->>'insurance_by','UNSPECIFIED') AS insurance_by,
                    COALESCE(row_data->>'insurer_name','UNSPECIFIED') AS insurer,
+                   COALESCE(NULLIF(row_data->>'insurance_source',''),'INHOUSE') AS insurance_source,
                    count(*)::int AS policy_count,
                    COALESCE(sum(NULLIF(row_data->>'actual_premium_amount','')::numeric),0) AS premium_amount
             FROM analytics.snapshot_rows
             WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
-            GROUP BY 1,2 ORDER BY policy_count DESC, insurance_by, insurer
+            GROUP BY 1,2,3 ORDER BY policy_count DESC, insurance_by, insurer
+            """, tenant_id=tenant_id, dump_id=latest["dump_id"])
+        source_split = _query_rows(connection, """
+            SELECT COALESCE(NULLIF(row_data->>'insurance_source',''),'INHOUSE') AS insurance_source,
+                   count(*)::int AS policy_count,
+                   COALESCE(sum(NULLIF(row_data->>'actual_premium_amount','')::numeric),0) AS premium_amount
+            FROM analytics.snapshot_rows
+            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
+            GROUP BY 1 ORDER BY policy_count DESC
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
         duplicate_agent_codes = _query_rows(connection, """
             SELECT row_data->>'agent_intermediary_code' AS agent_code, count(*)::int AS booking_count
@@ -144,7 +167,13 @@ def insurance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_
               AND NULLIF(row_data->>'agent_intermediary_code','') IS NOT NULL
             GROUP BY 1 HAVING count(*) > 1 ORDER BY booking_count DESC, agent_code
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
-    return {"tenant_id": tenant_id, "data_as_of": latest["data_as_of_utc"], "rows": rows, "duplicate_agent_codes": duplicate_agent_codes}
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "rows": rows,
+        "source_split": source_split,
+        "duplicate_agent_codes": duplicate_agent_codes,
+    }
 
 
 @router.get("/addons")
