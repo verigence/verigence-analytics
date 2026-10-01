@@ -56,6 +56,13 @@ jobs:
               '/v1/analytics/tenants/{tenant_id}/trade-in',
               '/v1/analytics/tenants/{tenant_id}/turnaround',
               '/v1/analytics/tenants/{tenant_id}/productivity',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/delivery-monthly',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/discount-waterfall',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/management-referral',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/compliance-families',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/trade-in-health',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/insurance-source',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/dealer-discount-grid',
           }
           missing=required-paths
           if missing: raise SystemExit('Missing routes: '+','.join(sorted(missing)))

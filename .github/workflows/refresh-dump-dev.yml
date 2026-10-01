@@ -1,0 +1,179 @@
+name: Refresh Analytics Dump DEV
+
+# Runs automatically after every successful Analytics deployment to DEV.
+# Also runnable manually to pull fresh audit-core data for all active DEV projects.
+#
+# Active DEV tenants (from audit-core-live-baseline, 2026-09-30):
+#   MahindraOrissa  5fbe26ab-6ed7-444a-8488-5bfb81208588  (primary — has DI documents)
+#   Mahindra Orissa afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
+#   Hyundai Orissa  4c4bef2a-1d01-498f-98b4-e4f9311282fb
+
+on:
+  workflow_run:
+    workflows: ["Deploy Analytics DEV"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tenant_ids:
+        description: "Comma-separated tenant IDs to dump (leave blank for all three active DEV projects)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analytics-dump-dev
+  cancel-in-progress: false
+
+jobs:
+  dump:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+      ANALYTICS_SERVICE: analytics
+      # All three active DEV project tenant IDs from audit-core-live-baseline 2026-09-30
+      DEFAULT_TENANT_IDS: "5fbe26ab-6ed7-444a-8488-5bfb81208588,afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572,4c4bef2a-1d01-498f-98b4-e4f9311282fb"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Analytics and Railway CLI
+        run: |
+          python -m pip install -e .
+          npm install --global @railway/cli
+
+      - name: Link Analytics DEV service
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          env -u RAILWAY_TOKEN railway link \
+            --project "$PLATFORM_PROJECT_ID" \
+            --environment "$PLATFORM_ENVIRONMENT_ID" \
+            --service "$ANALYTICS_SERVICE" \
+            --json >/dev/null
+
+      - name: Resolve tenant list
+        id: tenants
+        run: |
+          set -euo pipefail
+          INPUT="${{ inputs.tenant_ids }}"
+          RESOLVED="${INPUT:-$DEFAULT_TENANT_IDS}"
+          # Normalise: trim spaces, remove empty entries
+          CLEANED="$(echo "$RESOLVED" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | tr '\n' ',')"
+          CLEANED="${CLEANED%,}"
+          echo "tenant_list=$CLEANED" >> "$GITHUB_OUTPUT"
+          echo "Tenants to dump: $CLEANED"
+
+      - name: Dump MahindraOrissa (5fbe26ab)
+        if: contains(steps.tenants.outputs.tenant_list, '5fbe26ab-6ed7-444a-8488-5bfb81208588')
+        run: |
+          set -euo pipefail
+          echo "::group::Dumping MahindraOrissa"
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" \
+            python -m analytics.dump_cli \
+              --tenant '5fbe26ab-6ed7-444a-8488-5bfb81208588' \
+              --requested-by 'github-actions-auto'
+          echo "::endgroup::"
+
+      - name: Dump Mahindra Orissa (afa9e32b)
+        if: contains(steps.tenants.outputs.tenant_list, 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572')
+        run: |
+          set -euo pipefail
+          echo "::group::Dumping Mahindra Orissa"
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" \
+            python -m analytics.dump_cli \
+              --tenant 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572' \
+              --requested-by 'github-actions-auto'
+          echo "::endgroup::"
+
+      - name: Dump Hyundai Orissa (4c4bef2a)
+        if: contains(steps.tenants.outputs.tenant_list, '4c4bef2a-1d01-498f-98b4-e4f9311282fb')
+        run: |
+          set -euo pipefail
+          echo "::group::Dumping Hyundai Orissa"
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" \
+            python -m analytics.dump_cli \
+              --tenant '4c4bef2a-1d01-498f-98b4-e4f9311282fb' \
+              --requested-by 'github-actions-auto'
+          echo "::endgroup::"
+
+      - name: Verify dumps completed
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          url = os.environ['ANALYTICS_DB_URL']
+          for prefix, replacement in (
+              ('postgresql+asyncpg://', 'postgresql+psycopg://'),
+              ('postgresql://', 'postgresql+psycopg://'),
+              ('postgres://', 'postgresql+psycopg://'),
+          ):
+              if url.startswith(prefix):
+                  url = replacement + url[len(prefix):]
+                  break
+
+          engine = create_engine(url)
+          with engine.connect() as conn:
+              rows = conn.execute(text("""
+                  SELECT tenant_id,
+                         completed_at_utc,
+                         row_count,
+                         table_counts->>'dealer_discount_grid_versions' AS grid_versions,
+                         table_counts->>'dealer_discount_grid_rows'     AS grid_rows,
+                         table_counts->>'p2_management_referrals'       AS mr_referrals,
+                         table_counts->>'journeys'                      AS journeys,
+                         table_counts->>'discount_applications'         AS discounts
+                  FROM analytics.dump_runs
+                  WHERE status = 'COMPLETED'
+                    AND tenant_id IN (
+                        '5fbe26ab-6ed7-444a-8488-5bfb81208588',
+                        'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572',
+                        '4c4bef2a-1d01-498f-98b4-e4f9311282fb'
+                    )
+                  ORDER BY completed_at_utc DESC
+              """)).mappings().all()
+
+              if not rows:
+                  raise SystemExit('No completed dumps found for any DEV tenant')
+
+              seen = set()
+              for r in rows:
+                  tid = r['tenant_id']
+                  if tid in seen:
+                      continue
+                  seen.add(tid)
+                  print(
+                      f"DUMP_VERIFIED"
+                      f"|tenant={tid}"
+                      f"|completed={r['completed_at_utc']}"
+                      f"|rows={r['row_count']}"
+                      f"|journeys={r['journeys']}"
+                      f"|discounts={r['discounts']}"
+                      f"|grid_versions={r['grid_versions']}"
+                      f"|grid_rows={r['grid_rows']}"
+                      f"|mr_referrals={r['mr_referrals']}"
+                  )
+
+              missing = {
+                  '5fbe26ab-6ed7-444a-8488-5bfb81208588',
+                  'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572',
+                  '4c4bef2a-1d01-498f-98b4-e4f9311282fb',
+              } - seen
+              if missing:
+                  print(f'::warning::No completed dump found yet for: {missing}')
+
+          print('ANALYTICS_DUMP_VERIFY=PASS')
+          PY
