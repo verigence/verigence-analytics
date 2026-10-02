@@ -252,40 +252,94 @@ def turnaround(tenant_id: str, _: Annotated[Principal, Depends(require_analytics
 def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_read)]) -> dict:
     with analytics_engine().connect() as connection:
         latest = _latest_dump(connection, tenant_id)
-        rows = _query_rows(connection, """
-            WITH events AS (
-                SELECT COALESCE(row_data->>'actor_role_snapshot','UNSPECIFIED') AS actor_role,
-                       COALESCE(row_data->>'actor_id','UNSPECIFIED') AS actor_id,
-                       (NULLIF(row_data->>'occurred_at_utc','')::timestamptz)::date AS activity_date,
-                       count(*)::int AS activity_count
+        # Per-employee summary: journeys created, bookings, deliveries, time taken
+        summary = _query_rows(connection, """
+            WITH jny AS (
+                SELECT
+                    COALESCE(NULLIF(row_data->>'created_by_display_name',''), row_data->>'created_by_actor_id', 'Unknown') AS employee_name,
+                    row_data->>'created_by_actor_id' AS actor_id,
+                    row_data->>'journey_id' AS journey_id,
+                    NULLIF(row_data->>'created_at_utc','')::timestamptz AS journey_created_at
                 FROM analytics.snapshot_rows
-                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
-                  AND source_table='journey_workflow_events'
-                GROUP BY 1,2,3
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journeys'
             ),
-            staff AS (
-                SELECT row_data->>'dealership_staff_id' AS staff_id,
-                       COALESCE(
-                           NULLIF(row_data->>'display_name',''),
-                           NULLIF(row_data->>'full_name',''),
-                           NULLIF(row_data->>'email','')
-                       ) AS display_name,
-                       NULLIF(row_data->>'staff_role_code','') AS staff_role_code
+            bkg AS (
+                SELECT row_data->>'journey_id' AS journey_id,
+                       (NULLIF(row_data->>'booking_date','') IS NOT NULL) AS has_booking_date
                 FROM analytics.snapshot_rows
-                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
-                  AND source_table='dealership_staff'
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
+            ),
+            dlv AS (
+                SELECT row_data->>'journey_id' AS journey_id,
+                       NULLIF(row_data->>'actual_delivered_at','')::timestamptz AS actual_delivered_at,
+                       NULLIF(row_data->>'actual_delivery_status_code','') AS delivery_status,
+                       NULLIF(row_data->>'created_at_utc','')::timestamptz AS delivery_created_at
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='deliveries'
             )
-            SELECT e.actor_role,
-                   e.actor_id,
-                   COALESCE(s.display_name, e.actor_id) AS actor_name,
-                   s.staff_role_code,
-                   e.activity_date,
-                   e.activity_count
-            FROM events e
-            LEFT JOIN staff s ON s.staff_id = e.actor_id
-            ORDER BY e.activity_date DESC NULLS LAST, e.activity_count DESC
+            SELECT
+                j.employee_name,
+                j.actor_id,
+                count(DISTINCT j.journey_id)::int                               AS journeys_created,
+                count(DISTINCT b.journey_id)::int                               AS bookings,
+                count(DISTINCT b.journey_id) FILTER (WHERE b.has_booking_date)::int AS bookings_with_date,
+                count(DISTINCT d.journey_id) FILTER (WHERE d.delivery_status IS NOT NULL)::int AS deliveries_started,
+                count(DISTINCT d.journey_id) FILTER (WHERE d.actual_delivered_at IS NOT NULL)::int AS deliveries_completed,
+                round(avg(
+                    EXTRACT(EPOCH FROM (
+                        COALESCE(d.actual_delivered_at, d.delivery_created_at) - j.journey_created_at
+                    )) / 86400.0
+                ) FILTER (
+                    WHERE COALESCE(d.actual_delivered_at, d.delivery_created_at) IS NOT NULL
+                ), 1)::float AS avg_days_journey_to_delivery,
+                round(avg(
+                    EXTRACT(EPOCH FROM (d.actual_delivered_at - j.journey_created_at)) / 86400.0
+                ) FILTER (
+                    WHERE d.actual_delivered_at IS NOT NULL
+                ), 1)::float AS avg_days_to_completion
+            FROM jny j
+            LEFT JOIN bkg b ON b.journey_id = j.journey_id
+            LEFT JOIN dlv d ON d.journey_id = j.journey_id
+            GROUP BY j.employee_name, j.actor_id
+            ORDER BY journeys_created DESC
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
-    return {"tenant_id": tenant_id, "data_as_of": latest["data_as_of_utc"], "rows": rows}
+
+        # Per-journey detail row for the table
+        journeys = _query_rows(connection, """
+            SELECT
+                j.row_data->>'journey_reference'           AS journey_ref,
+                COALESCE(NULLIF(j.row_data->>'created_by_display_name',''), j.row_data->>'created_by_actor_id','Unknown') AS employee_name,
+                NULLIF(j.row_data->>'created_at_utc','')::timestamptz::date  AS created_date,
+                NULLIF(b.row_data->>'booking_date','')::date                 AS booking_date,
+                NULLIF(b.row_data->>'booking_reference','')                  AS booking_ref,
+                d.row_data->>'actual_delivery_status_code'                   AS delivery_status,
+                NULLIF(d.row_data->>'actual_delivered_at','')::timestamptz::date AS delivered_date,
+                CASE
+                    WHEN NULLIF(d.row_data->>'actual_delivered_at','') IS NOT NULL
+                    THEN round(EXTRACT(EPOCH FROM (
+                        NULLIF(d.row_data->>'actual_delivered_at','')::timestamptz
+                        - NULLIF(j.row_data->>'created_at_utc','')::timestamptz
+                    )) / 86400.0, 1)::float
+                END AS days_to_delivery
+            FROM analytics.snapshot_rows j
+            LEFT JOIN analytics.snapshot_rows b
+                   ON b.tenant_id=j.tenant_id AND b.dump_id=j.dump_id
+                  AND b.source_table='bookings'
+                  AND b.row_data->>'journey_id'=j.row_data->>'journey_id'
+            LEFT JOIN analytics.snapshot_rows d
+                   ON d.tenant_id=j.tenant_id AND d.dump_id=j.dump_id
+                  AND d.source_table='deliveries'
+                  AND d.row_data->>'journey_id'=j.row_data->>'journey_id'
+            WHERE j.tenant_id=:tenant_id AND j.dump_id=:dump_id AND j.source_table='journeys'
+            ORDER BY j.row_data->>'created_at_utc' DESC
+            """, tenant_id=tenant_id, dump_id=latest["dump_id"])
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "summary": summary,
+        "journeys": journeys,
+    }
 
 
 @router.get("/dashboard")

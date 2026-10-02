@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: verigence-analytics
+Version: 0.1.0
+Summary: Independent Verigence analytics service
+Requires-Python: <3.13,>=3.12
+Requires-Dist: fastapi==0.139.2
+Requires-Dist: uvicorn[standard]==0.51.0
+Requires-Dist: SQLAlchemy==2.0.51
+Requires-Dist: alembic==1.18.5
+Requires-Dist: psycopg[binary]==3.3.4
+Requires-Dist: PyJWT[crypto]==2.13.0
+Requires-Dist: httpx<1.0,>=0.27.0
+Requires-Dist: structlog>=24.1.0
+Provides-Extra: test
+Requires-Dist: pytest==9.1.1; extra == "test"
+Provides-Extra: lint
+Requires-Dist: ruff==0.16.0; extra == "lint"
