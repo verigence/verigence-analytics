@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import Connection
 
 from analytics.db import analytics_engine
+from analytics.pricing_audit import pricing_integrity_report
 from analytics.reports import _latest_dump, _query_rows
 from analytics.security import Principal, require_analytics_read
 
@@ -160,6 +161,38 @@ discounts AS (
     SELECT row_data->>'journey_id' AS journey_id,
            sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) AS actual_discount_amount,
            sum(NULLIF(row_data->>'standard_eligible_amount','')::numeric) AS eligible_discount_amount,
+           COALESCE(sum(CASE
+               WHEN NULLIF(row_data->>'actual_discount_amount','')::numeric IS NULL THEN 0
+               WHEN row_data->>'discount_key'='OTHER_SCHEME' AND EXISTS (
+                   SELECT 1 FROM analytics.snapshot_rows mr
+                   WHERE mr.tenant_id=:tenant_id AND mr.dump_id=:dump_id
+                     AND mr.source_table='p2_management_referrals'
+                     AND mr.row_data->>'journey_id'=row_data->>'journey_id'
+                     AND COALESCE(NULLIF(mr.row_data->>'opted','')::boolean,false)
+               ) THEN 0
+               WHEN NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
+                   AND NULLIF(row_data->>'actual_discount_amount','')::numeric
+                       - NULLIF(row_data->>'standard_eligible_amount','')::numeric > 100
+                   THEN NULLIF(row_data->>'actual_discount_amount','')::numeric
+                       - NULLIF(row_data->>'standard_eligible_amount','')::numeric
+               WHEN (upper(COALESCE(row_data->>'eligibility_result',''))='NOT_ELIGIBLE'
+                     OR row_data->>'discount_key'='ADDITIONAL_DISCOUNT')
+                    AND NULLIF(row_data->>'actual_discount_amount','')::numeric > 100
+                   THEN NULLIF(row_data->>'actual_discount_amount','')::numeric
+               ELSE 0
+           END),0) AS above_eligible_discount_amount,
+           count(*) FILTER (
+               WHERE NULLIF(row_data->>'actual_discount_amount','')::numeric IS NOT NULL
+                 AND (row_data->>'discount_key'='OTHER_SCHEME' AND EXISTS (
+                     SELECT 1 FROM analytics.snapshot_rows mr
+                     WHERE mr.tenant_id=:tenant_id AND mr.dump_id=:dump_id
+                       AND mr.source_table='p2_management_referrals'
+                       AND mr.row_data->>'journey_id'=row_data->>'journey_id'
+                       AND COALESCE(NULLIF(mr.row_data->>'opted','')::boolean,false)
+                 ) OR (NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NULL
+                       AND upper(COALESCE(row_data->>'eligibility_result',''))<>'NOT_ELIGIBLE'
+                       AND row_data->>'discount_key'<>'ADDITIONAL_DISCOUNT'))
+           )::int AS unknown_entitlement_count,
            bool_or(NULLIF(row_data->>'actual_discount_amount','') IS NOT NULL) AS actual_present,
            bool_or(NULLIF(row_data->>'standard_eligible_amount','') IS NOT NULL) AS eligible_present,
            -- per-key actual amounts for discount waterfall charts
@@ -187,12 +220,24 @@ discounts AS (
            bool_or(row_data->>'discount_key'='MANAGEMENT_REFERRAL'
                AND NULLIF(row_data->>'actual_discount_amount','') IS NOT NULL) AS has_mr_discount,
            -- above-eligible per journey (actual > standard on any single key)
-           bool_or(
+           COALESCE(bool_or(
                NULLIF(row_data->>'actual_discount_amount','')::numeric IS NOT NULL
-               AND NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
-               AND NULLIF(row_data->>'actual_discount_amount','')::numeric
-                   > NULLIF(row_data->>'standard_eligible_amount','')::numeric
-           ) AS has_excess_on_any_key
+               AND NOT (row_data->>'discount_key'='OTHER_SCHEME' AND EXISTS (
+                   SELECT 1 FROM analytics.snapshot_rows mr
+                   WHERE mr.tenant_id=:tenant_id AND mr.dump_id=:dump_id
+                     AND mr.source_table='p2_management_referrals'
+                     AND mr.row_data->>'journey_id'=row_data->>'journey_id'
+                     AND COALESCE(NULLIF(mr.row_data->>'opted','')::boolean,false)
+               ))
+               AND NULLIF(row_data->>'actual_discount_amount','')::numeric >
+                   CASE
+                       WHEN NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
+                           THEN NULLIF(row_data->>'standard_eligible_amount','')::numeric
+                       WHEN upper(COALESCE(row_data->>'eligibility_result',''))='NOT_ELIGIBLE'
+                            OR row_data->>'discount_key'='ADDITIONAL_DISCOUNT' THEN 0
+                       ELSE NULL
+                   END + 100
+           ),false) AS has_excess_on_any_key
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id
       AND source_table='discount_applications'
@@ -262,6 +307,7 @@ deal_facts AS (
            o.city,
            o.state_region,
            b.booking_date,
+           (b.journey_id IS NOT NULL) AS has_booking,
            b.booking_confirmation_date,
            b.expected_delivery_date,
            b.deal_type_code,
@@ -307,6 +353,8 @@ deal_facts AS (
            COALESCE(di.eligible_discount_amount,0) AS eligible_discount_amount,
            COALESCE(di.actual_present,false) AS actual_discount_present,
            COALESCE(di.eligible_present,false) AS eligible_discount_present,
+           COALESCE(di.above_eligible_discount_amount,0) AS above_eligible_discount_amount,
+           COALESCE(di.unknown_entitlement_count,0) AS unknown_entitlement_count,
            COALESCE(di.dk_cash_discount,0) AS dk_cash_discount,
            COALESCE(di.dk_exchange_bonus,0) AS dk_exchange_bonus,
            COALESCE(di.dk_scrappage,0) AS dk_scrappage,
@@ -420,15 +468,16 @@ def business_overview(
                 _DEAL_FACTS_CTE
                 + """
                 SELECT count(*)::int AS journeys,
+                       count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
                        count(*) FILTER (WHERE has_delivery_record)::int AS delivery_records,
                        count(*) FILTER (WHERE actual_delivered_at IS NOT NULL)::int
                            AS actual_deliveries,
-                       count(*) FILTER (WHERE has_finance)::int AS finance_journeys,
-                       count(*) FILTER (WHERE has_insurance)::int AS insurance_journeys,
-                       count(*) FILTER (WHERE has_trade_in)::int AS trade_in_journeys,
-                       count(*) FILTER (WHERE has_accessories)::int AS accessory_journeys,
-                       count(*) FILTER (WHERE has_ew)::int AS ew_journeys,
-                       count(*) FILTER (WHERE has_rsa)::int AS rsa_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_finance)::int AS finance_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insurance_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_trade_in)::int AS trade_in_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_accessories)::int AS accessory_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_ew)::int AS ew_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_rsa)::int AS rsa_journeys,
                        count(*) FILTER (WHERE finding_count > 0)::int
                            AS journeys_with_findings,
                        count(*) FILTER (WHERE missing_document_flag_count > 0)::int
@@ -444,20 +493,21 @@ def business_overview(
             )
         )
         total = int(summary.get("journeys") or 0)
+        booked = int(summary.get("booked_journeys") or 0)
         summary.update(
             {
-                "finance_penetration_pct": _rate(summary.get("finance_journeys") or 0, total),
+                "finance_penetration_pct": _rate(summary.get("finance_journeys") or 0, booked),
                 "insurance_penetration_pct": _rate(
-                    summary.get("insurance_journeys") or 0, total
+                    summary.get("insurance_journeys") or 0, booked
                 ),
                 "trade_in_penetration_pct": _rate(
-                    summary.get("trade_in_journeys") or 0, total
+                    summary.get("trade_in_journeys") or 0, booked
                 ),
                 "accessory_penetration_pct": _rate(
-                    summary.get("accessory_journeys") or 0, total
+                    summary.get("accessory_journeys") or 0, booked
                 ),
-                "ew_penetration_pct": _rate(summary.get("ew_journeys") or 0, total),
-                "rsa_penetration_pct": _rate(summary.get("rsa_journeys") or 0, total),
+                "ew_penetration_pct": _rate(summary.get("ew_journeys") or 0, booked),
+                "rsa_penetration_pct": _rate(summary.get("rsa_journeys") or 0, booked),
                 "journeys_with_findings_pct": _rate(
                     summary.get("journeys_with_findings") or 0, total
                 ),
@@ -474,11 +524,12 @@ def business_overview(
             _DEAL_FACTS_CTE
             + """
             SELECT COALESCE(model_name,'Unresolved') AS model_name,
-                   count(*)::int AS journey_count,
+                   count(*) FILTER (WHERE has_booking)::int AS journey_count,
                    count(*) FILTER (WHERE actual_delivered_at IS NOT NULL)::int
                        AS actual_deliveries,
                    COALESCE(sum(actual_discount_amount),0) AS discount_amount
             FROM deal_facts
+            WHERE has_booking
             GROUP BY 1
             ORDER BY journey_count DESC, model_name
             LIMIT 10
@@ -491,7 +542,7 @@ def business_overview(
             _DEAL_FACTS_CTE
             + """
             SELECT dealer_id, dealer_name, outlet_id, outlet_name,
-                   count(*)::int AS journey_count,
+                   count(*) FILTER (WHERE has_booking)::int AS journey_count,
                    count(*) FILTER (WHERE actual_delivered_at IS NOT NULL)::int
                        AS actual_deliveries,
                    count(*) FILTER (WHERE finding_count > 0)::int
@@ -500,6 +551,7 @@ def business_overview(
                    count(*) FILTER (WHERE has_insurance)::int AS insurance_journeys,
                    count(*) FILTER (WHERE has_accessories)::int AS accessory_journeys
             FROM deal_facts
+            WHERE has_booking
             GROUP BY dealer_id, dealer_name, outlet_id, outlet_name
             ORDER BY journey_count DESC, dealer_name, outlet_name
             """,
@@ -609,12 +661,13 @@ def sales_product(
             _DEAL_FACTS_CTE
             + """
             SELECT dealer_id, dealer_name, outlet_id, outlet_name,
-                   count(*)::int AS journey_count,
+                   count(*) FILTER (WHERE has_booking)::int AS journey_count,
                    count(*) FILTER (WHERE has_delivery_record)::int AS delivery_records,
                    count(*) FILTER (WHERE actual_delivered_at IS NOT NULL)::int
                        AS actual_deliveries,
                    COALESCE(sum(payment_amount),0) AS payment_amount
             FROM deal_facts
+            WHERE has_booking
             GROUP BY dealer_id, dealer_name, outlet_id, outlet_name
             ORDER BY journey_count DESC, dealer_name, outlet_name
             """,
@@ -627,12 +680,13 @@ def sales_product(
             + """
             SELECT COALESCE(model_name,'Unresolved') AS model_name,
                    COALESCE(variant_name,'Unresolved') AS variant_name,
-                   count(*)::int AS journey_count,
+                   count(*) FILTER (WHERE has_booking)::int AS journey_count,
                    count(*) FILTER (WHERE actual_delivered_at IS NOT NULL)::int
                        AS actual_deliveries,
                    COALESCE(sum(actual_discount_amount),0) AS discount_amount,
                    COALESCE(sum(payment_amount),0) AS payment_amount
             FROM deal_facts
+            WHERE has_booking
             GROUP BY 1,2
             ORDER BY journey_count DESC, model_name, variant_name
             """,
@@ -646,6 +700,7 @@ def sales_product(
             SELECT COALESCE(colour_name,'Unresolved') AS colour_name,
                    count(*)::int AS journey_count
             FROM deal_facts
+            WHERE has_booking
             GROUP BY 1
             ORDER BY journey_count DESC, colour_name
             """,
@@ -850,15 +905,10 @@ def discount_intelligence(
                        round(avg(actual_discount_amount) FILTER (
                            WHERE actual_delivered_at IS NOT NULL
                        ),2) AS avg_discount_per_actual_delivery,
-                       COALESCE(sum(
-                           GREATEST(actual_discount_amount-eligible_discount_amount,0)
-                       ) FILTER (
-                           WHERE actual_discount_present AND eligible_discount_present
-                       ),0) AS above_eligible_discount_amount,
+                       COALESCE(sum(above_eligible_discount_amount),0)
+                           AS above_eligible_discount_amount,
                        count(*) FILTER (
-                           WHERE actual_discount_present
-                             AND eligible_discount_present
-                             AND actual_discount_amount > eligible_discount_amount
+                           WHERE has_excess_on_any_key
                        )::int AS above_eligible_journeys
                 FROM deal_facts
                 """,
@@ -921,6 +971,20 @@ def discount_intelligence(
             ORDER BY actual_discount_amount DESC, discount_key
             """,
         )
+        pricing_integrity = pricing_integrity_report(
+            connection,
+            tenant_id=tenant_id,
+            dump_id=latest["dump_id"],
+            total_journeys=int(summary.get("journeys") or 0),
+        )
+        # Preserve the legacy response shape while using the same per-key
+        # comparison as the focused price-integrity report.
+        summary["above_eligible_discount_amount"] = (
+            pricing_integrity["summary"]["known_excess_discount_amount"]
+        )
+        summary["above_eligible_journeys"] = (
+            pricing_integrity["summary"]["known_excess_discount_journeys"]
+        )
     finally:
         connection.close()
 
@@ -931,8 +995,10 @@ def discount_intelligence(
         "by_model": by_model,
         "by_outlet": by_outlet,
         "by_discount_key": by_key,
+        "pricing_integrity": pricing_integrity,
         "above_eligible_definition": (
-            "Computed only where both actual and eligible discount values are populated."
+            "Per-application actual less known entitlement, without netting across discount keys. "
+            "Unknown entitlements are excluded and shown in pricing_integrity coverage."
         ),
     }
 
@@ -952,19 +1018,22 @@ def insurance_intelligence(
                 _DEAL_FACTS_CTE
                 + """
                 SELECT count(*)::int AS journeys,
-                       count(*) FILTER (WHERE has_insurance)::int AS insurance_journeys,
+                       count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insurance_journeys,
                        count(*) FILTER (
-                           WHERE has_insurance AND actual_premium_amount IS NOT NULL
+                           WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
                        )::int AS premium_populated,
-                       COALESCE(sum(actual_premium_amount),0) AS premium_amount,
+                       COALESCE(sum(actual_premium_amount) FILTER (
+                           WHERE has_booking AND has_insurance
+                       ),0) AS premium_amount,
                        round(avg(actual_premium_amount) FILTER (
-                           WHERE actual_premium_amount IS NOT NULL
+                           WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
                        ),2) AS avg_premium,
                        count(*) FILTER (
-                           WHERE has_insurance AND self_insurance_flag IS TRUE
+                           WHERE has_booking AND has_insurance AND self_insurance_flag IS TRUE
                        )::int AS self_insurance_journeys,
                        count(*) FILTER (
-                           WHERE insurance_add_ons IS NOT NULL
+                           WHERE has_booking AND has_insurance AND insurance_add_ons IS NOT NULL
                              AND jsonb_typeof(insurance_add_ons)='array'
                              AND jsonb_array_length(insurance_add_ons)>0
                        )::int AS policies_with_add_ons
@@ -972,7 +1041,7 @@ def insurance_intelligence(
                 """,
             )
         )
-        total_journeys = int(summary.get("journeys") or 0)
+        total_journeys = int(summary.get("booked_journeys") or 0)
         insurance_journeys = int(summary.get("insurance_journeys") or 0)
         summary["insurance_penetration_pct"] = _rate(insurance_journeys, total_journeys)
         summary["add_on_policy_attach_pct"] = _rate(
@@ -987,16 +1056,18 @@ def insurance_intelligence(
             _DEAL_FACTS_CTE
             + """
             SELECT COALESCE(insurer_name,'Unspecified') AS insurer_name,
-                   count(*) FILTER (WHERE has_insurance)::int AS policy_count,
+                   count(*) FILTER (WHERE has_booking AND has_insurance)::int AS policy_count,
                    count(*) FILTER (
-                       WHERE has_insurance AND actual_premium_amount IS NOT NULL
+                       WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
                    )::int AS premium_populated,
-                   COALESCE(sum(actual_premium_amount),0) AS premium_amount,
+                   COALESCE(sum(actual_premium_amount) FILTER (
+                       WHERE has_booking AND has_insurance
+                   ),0) AS premium_amount,
                    round(avg(actual_premium_amount) FILTER (
-                       WHERE actual_premium_amount IS NOT NULL
+                       WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
                    ),2) AS avg_premium
             FROM deal_facts
-            WHERE has_insurance
+            WHERE has_booking AND has_insurance
             GROUP BY 1
             ORDER BY policy_count DESC, insurer_name
             """,
@@ -1010,7 +1081,7 @@ def insurance_intelligence(
             SELECT COALESCE(insurance_by,'Unspecified') AS insurance_by,
                    count(*)::int AS policy_count
             FROM deal_facts
-            WHERE has_insurance
+            WHERE has_booking AND has_insurance
             GROUP BY 1
             ORDER BY policy_count DESC, insurance_by
             """,
@@ -1023,9 +1094,15 @@ def insurance_intelligence(
             WITH policies AS (
                 SELECT row_data->>'journey_id' AS journey_id,
                        row_data->'add_ons' AS add_ons
-                FROM analytics.snapshot_rows
-                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
-                  AND source_table='insurance_records'
+                FROM analytics.snapshot_rows i
+                WHERE i.tenant_id=:tenant_id AND i.dump_id=:dump_id
+                  AND i.source_table='insurance_records'
+                  AND EXISTS (
+                      SELECT 1 FROM analytics.snapshot_rows b
+                      WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                        AND b.source_table='bookings'
+                        AND b.row_data->>'journey_id'=i.row_data->>'journey_id'
+                  )
             )
             SELECT add_on.add_on_name,
                    count(DISTINCT p.journey_id)::int AS policy_count
@@ -1070,9 +1147,9 @@ def vas_intelligence(
                 latest,
                 tenant_id,
                 """
-                SELECT count(*)::int AS journeys
+                SELECT count(DISTINCT row_data->>'journey_id')::int AS journeys
                 FROM analytics.snapshot_rows
-                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journeys'
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
                 """,
             )
         )
@@ -1082,15 +1159,21 @@ def vas_intelligence(
             latest,
             tenant_id,
             """
-            SELECT upper(COALESCE(row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
+            SELECT upper(COALESCE(a.row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
                    count(*)::int AS record_count,
-                   count(DISTINCT row_data->>'journey_id')::int AS journey_count,
-                   COALESCE(sum(NULLIF(row_data->>'actual_amount','')::numeric),0)
+                   count(DISTINCT a.row_data->>'journey_id')::int AS journey_count,
+                   COALESCE(sum(NULLIF(a.row_data->>'actual_amount','')::numeric),0)
                        AS actual_amount,
-                   round(avg(NULLIF(row_data->>'actual_amount','')::numeric),2)
+                   round(avg(NULLIF(a.row_data->>'actual_amount','')::numeric),2)
                        AS avg_record_amount
-            FROM analytics.snapshot_rows
-            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journey_addons'
+            FROM analytics.snapshot_rows a
+            WHERE a.tenant_id=:tenant_id AND a.dump_id=:dump_id AND a.source_table='journey_addons'
+              AND EXISTS (
+                  SELECT 1 FROM analytics.snapshot_rows b
+                  WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                    AND b.source_table='bookings'
+                    AND b.row_data->>'journey_id'=a.row_data->>'journey_id'
+              )
             GROUP BY 1
             ORDER BY journey_count DESC, addon_type
             """,
@@ -1126,12 +1209,18 @@ def vas_intelligence(
                   AND source_table='dealer_outlets'
             ),
             addon_rows AS (
-                SELECT row_data->>'journey_id' AS journey_id,
-                       upper(COALESCE(row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
-                       NULLIF(row_data->>'actual_amount','')::numeric AS actual_amount
-                FROM analytics.snapshot_rows
-                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
-                  AND source_table='journey_addons'
+                SELECT a.row_data->>'journey_id' AS journey_id,
+                       upper(COALESCE(a.row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
+                       NULLIF(a.row_data->>'actual_amount','')::numeric AS actual_amount
+                FROM analytics.snapshot_rows a
+                WHERE a.tenant_id=:tenant_id AND a.dump_id=:dump_id
+                  AND a.source_table='journey_addons'
+                  AND EXISTS (
+                      SELECT 1 FROM analytics.snapshot_rows b
+                      WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                        AND b.source_table='bookings'
+                        AND b.row_data->>'journey_id'=a.row_data->>'journey_id'
+                  )
             )
             SELECT d.dealer_name, o.outlet_name, a.addon_type,
                    count(DISTINCT a.journey_id)::int AS journey_count,
