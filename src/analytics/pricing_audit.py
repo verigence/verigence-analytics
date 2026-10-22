@@ -16,7 +16,7 @@ from sqlalchemy.engine import Connection
 
 _PRICE_RULES = {"DEAL_UNDERCHARGED", "DEAL_TOTAL_VARIANCE_NEGATIVE"}
 _DISCOUNT_RULE = "EXCESS_DISCOUNT"
-_RULES = _PRICE_RULES | {_DISCOUNT_RULE}
+_INVOICE_DISAGREEMENT_RULE = "INVOICE_FIELD_DISAGREEMENT"
 _LINE_TOLERANCE = Decimal("100")
 _INVOICE_SOURCE_TYPES = {
     "tax_invoice_tally",
@@ -292,8 +292,12 @@ def pricing_integrity_report(
         JOIN analytics.snapshot_rows f ON f.tenant_id=:tenant_id AND f.dump_id=:dump_id
           AND f.source_table='audit_findings' AND f.row_data->>'journey_id'=d.journey_id
         WHERE upper(COALESCE(f.row_data->>'finding_status','')) IN ('OPEN','ACKNOWLEDGED')
-          AND split_part(upper(COALESCE(f.row_data->>'rule_key','')), ':', 1)
-              = ANY(ARRAY['DEAL_UNDERCHARGED','DEAL_TOTAL_VARIANCE_NEGATIVE','EXCESS_DISCOUNT'])
+          AND (
+              split_part(upper(COALESCE(f.row_data->>'rule_key','')), ':', 1)
+                  = ANY(ARRAY['DEAL_UNDERCHARGED','DEAL_TOTAL_VARIANCE_NEGATIVE','EXCESS_DISCOUNT'])
+              OR upper(COALESCE(f.row_data->>'rule_key','')) LIKE 'INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:%'
+              OR upper(COALESCE(f.row_data->>'rule_key','')) LIKE 'INVOICE_FIELD_DISAGREEMENT:DISCOUNT:%'
+          )
         """, params)
 
     # DEAL_TOTAL_VARIANCE_NEGATIVE overlaps the more detailed
@@ -314,18 +318,24 @@ def pricing_integrity_report(
 
     price_journeys = {row["journey_id"] for row in findings if row["rule_key"] in _PRICE_RULES}
     discount_journeys = {row["journey_id"] for row in findings if row["rule_key"] == _DISCOUNT_RULE}
-    any_exception_journeys = price_journeys | discount_journeys
+    invoice_conflict_journeys = {
+        row["journey_id"] for row in findings if row["rule_key"] == _INVOICE_DISAGREEMENT_RULE
+    }
+    any_exception_journeys = price_journeys | discount_journeys | invoice_conflict_journeys
 
     exception_by_outlet: dict[tuple[str, str], dict[str, Any]] = {}
     for row in findings:
         key = (row["dealer_name"], row["outlet_name"])
         outlet = exception_by_outlet.setdefault(key, {
             "price_journey_ids": set(), "discount_journey_ids": set(),
+            "invoice_conflict_journey_ids": set(),
         })
         if row["rule_key"] in _PRICE_RULES:
             outlet["price_journey_ids"].add(row["journey_id"])
         if row["rule_key"] == _DISCOUNT_RULE:
             outlet["discount_journey_ids"].add(row["journey_id"])
+        if row["rule_key"] == _INVOICE_DISAGREEMENT_RULE:
+            outlet["invoice_conflict_journey_ids"].add(row["journey_id"])
 
     outlet_rows = []
     for key in set(exception_by_outlet) | set(outlet_rows_by_name):
@@ -336,11 +346,13 @@ def pricing_integrity_report(
             "outlet_name": key[1],
             "price_exception_journeys": len(audit_counts.get("price_journey_ids", set())),
             "discount_exception_journeys": len(audit_counts.get("discount_journey_ids", set())),
+            "invoice_conflict_journeys": len(audit_counts.get("invoice_conflict_journey_ids", set())),
             "known_excess_discount_amount": discount_data.get("known_excess_discount_amount", Decimal(0)),
             "unknown_discount_applications": discount_data.get("unknown_discount_applications", 0),
         })
     outlet_rows.sort(key=lambda row: (
-        -(row["price_exception_journeys"] + row["discount_exception_journeys"]),
+        -(row["price_exception_journeys"] + row["discount_exception_journeys"]
+          + row["invoice_conflict_journeys"]),
         -row["known_excess_discount_amount"], row["dealer_name"], row["outlet_name"],
     ))
 
@@ -356,6 +368,7 @@ def pricing_integrity_report(
             "total_journeys": int(total_journeys or 0),
             "price_exception_journeys": len(price_journeys),
             "discount_exception_journeys": len(discount_journeys),
+            "invoice_conflict_journeys": len(invoice_conflict_journeys),
             "journeys_with_pricing_exceptions": len(any_exception_journeys),
             **discount_summary,
             **line_coverage,
@@ -364,7 +377,11 @@ def pricing_integrity_report(
         "by_outlet": outlet_rows[:50],
         "exceptions": findings[:200],
         "definitions": {
-            "exception_status": "Current OPEN and ACKNOWLEDGED Audit Core pricing findings in the latest snapshot.",
+            "exception_status": (
+                "Current OPEN and ACKNOWLEDGED Audit Core pricing findings in the latest snapshot, "
+                "including price undercharges, excess discounts, and invoice disagreements on "
+                "commercial price or discount fields."
+            ),
             "known_excess_discount": (
                 "Per application, actual discount less its captured entitlement, floored at zero. "
                 "Applications without a known entitlement, including unattributed management-referral "
