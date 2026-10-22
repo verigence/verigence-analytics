@@ -1,6 +1,11 @@
 from decimal import Decimal
 
-from analytics.pricing_audit import _decimal, _discount_audit, _discount_entitlement, _price_line_coverage
+from analytics.pricing_audit import (
+    _decimal,
+    _discount_audit,
+    _discount_entitlement,
+    _price_line_coverage,
+)
 
 
 def _discount_row(
@@ -34,10 +39,10 @@ def test_discount_excess_is_compared_per_application_without_cross_key_netting()
 
     summary, outlets = _discount_audit(rows)
 
-    assert summary["known_excess_discount_amount"] == Decimal("200")
+    assert summary["known_excess_discount_amount"] == Decimal(200)
     assert summary["known_excess_discount_journeys"] == 1
     assert summary["known_excess_application_count"] == 1
-    assert outlets[("Dealer A", "Outlet 1")]["known_excess_discount_amount"] == Decimal("200")
+    assert outlets[("Dealer A", "Outlet 1")]["known_excess_discount_amount"] == Decimal(200)
 
 
 def test_discount_tolerance_and_unknown_entitlements_are_kept_separate() -> None:
@@ -55,7 +60,7 @@ def test_discount_tolerance_and_unknown_entitlements_are_kept_separate() -> None
         [within_tolerance, above_tolerance, unknown, unattributed_mr, not_eligible]
     )
 
-    assert summary["known_excess_discount_amount"] == Decimal("601")
+    assert summary["known_excess_discount_amount"] == Decimal(601)
     assert summary["known_excess_application_count"] == 2
     assert summary["unknown_entitlement_application_count"] == 2
     assert summary["by_discount_key"][0]["discount_key"] == "EXCHANGE_BONUS"
