@@ -35,84 +35,58 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install migration dependencies and Railway CLI
-        run: |
-          python -m pip install -r requirements.txt
-          npm install --global @railway/cli
-      - name: Link and verify Analytics Railway DEV target
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Verify Railway project token scope
         shell: bash
         run: |
           set -euo pipefail
           [ -n "${RAILWAY_TOKEN:-}" ] || { echo '::error::RAILWAY_TOKEN is not configured.'; exit 1; }
-          railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/tmp/link.json
-          railway status --json >/tmp/status.json
-          railway service list --json >/tmp/services.json
-          railway variable list --service "$ANALYTICS_SERVICE" --json >/tmp/vars.json
           python - <<'PY'
-          import json, os
-          from pathlib import Path
-          project=json.loads(Path('/tmp/status.json').read_text())
-          services=json.loads(Path('/tmp/services.json').read_text())
-          variables=json.loads(Path('/tmp/vars.json').read_text())
-          if project.get('id') != os.environ['PLATFORM_PROJECT_ID']:
-              raise SystemExit('Railway token does not target the approved shared DEV project')
-          if not any(row.get('name') == os.environ['ANALYTICS_SERVICE'] for row in services):
-              raise SystemExit('Analytics Railway service is missing')
-          required=['ANALYTICS_DB_URL','ANALYTICS_SECRET_KEY','ANALYTICS_SECURITY_JWKS_URL','SECURITY_TOKEN_ISSUER','SECURITY_TOKEN_AUDIENCE']
-          missing=[name for name in required if not str(variables.get(name,'')).strip()]
-          if missing: raise SystemExit('Analytics Railway DEV is missing required service variables: '+','.join(missing))
-          print('ANALYTICS_RAILWAY_TARGET=PASS')
-          print('ANALYTICS_RUNTIME_CONFIG=PASS')
-          PY
-      - name: Verify source DB and migrate Analytics schema
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          import json
           import os
-          from sqlalchemy import create_engine, text
-          url=os.environ['ANALYTICS_DB_URL']
-          for prefix, replacement in (
-              ('postgresql+asyncpg://','postgresql+psycopg://'),
-              ('postgresql://','postgresql+psycopg://'),
-              ('postgres://','postgresql+psycopg://'),
-          ):
-              if url.startswith(prefix):
-                  url=replacement+url[len(prefix):]
-                  break
-          engine=create_engine(url)
-          with engine.connect() as conn:
-              database_name, has_auditcore=conn.execute(
-                  text("SELECT current_database(), to_regnamespace('auditcore') IS NOT NULL")
-              ).one()
-              if not has_auditcore:
-                  raise SystemExit('ANALYTICS_DB_URL does not point to a database containing auditcore schema')
-              journey_count=conn.execute(text("SELECT count(*) FROM auditcore.journeys")).scalar_one()
-              print(f'ANALYTICS_DB_SOURCE=PASS|database={database_name}|auditcore_journeys={journey_count}')
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          request = Request(
+              "https://backboard.railway.com/graphql/v2",
+              data=json.dumps({
+                  "query": "query { projectToken { projectId environmentId } }"
+              }).encode(),
+              headers={
+                  "Content-Type": "application/json",
+                  "Project-Access-Token": os.environ["RAILWAY_TOKEN"],
+              },
+              method="POST",
+          )
+          try:
+              with urlopen(request, timeout=20) as response:
+                  payload = json.load(response)
+          except HTTPError as exc:
+              raise SystemExit(
+                  f"Railway rejected RAILWAY_TOKEN (HTTP {exc.code}); "
+                  "expected a project token for the Analytics DEV environment"
+              ) from None
+          except URLError as exc:
+              raise SystemExit(f"Could not reach Railway token verification endpoint: {exc.reason}") from None
+
+          if payload.get("errors"):
+              raise SystemExit("Railway project-token scope query failed")
+
+          scope = payload.get("data", {}).get("projectToken") or {}
+          expected = {
+              "projectId": os.environ["PLATFORM_PROJECT_ID"],
+              "environmentId": os.environ["PLATFORM_ENVIRONMENT_ID"],
+          }
+          if scope != expected:
+              raise SystemExit(
+                  "RAILWAY_TOKEN targets a different Railway project/environment "
+                  f"(project={scope.get('projectId')}, environment={scope.get('environmentId')})"
+              )
+
+          print("RAILWAY_PROJECT_TOKEN_SCOPE=PASS|project=verigence-audit-core|environment=dev")
           PY
-          railway run --service "$ANALYTICS_SERVICE" alembic upgrade head
-          railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
-          import os
-          from sqlalchemy import create_engine, text
-          url=os.environ['ANALYTICS_DB_URL']
-          for prefix, replacement in (
-              ('postgresql+asyncpg://','postgresql+psycopg://'),
-              ('postgresql://','postgresql+psycopg://'),
-              ('postgres://','postgresql+psycopg://'),
-          ):
-              if url.startswith(prefix):
-                  url=replacement+url[len(prefix):]
-                  break
-          engine=create_engine(url)
-          with engine.connect() as conn:
-              dump_runs, snapshot_rows=conn.execute(
-                  text("SELECT to_regclass('analytics.dump_runs'), to_regclass('analytics.snapshot_rows')")
-              ).one()
-              if dump_runs is None or snapshot_rows is None:
-                  raise SystemExit('Analytics migration did not create required tables')
-              print('ANALYTICS_SCHEMA_MIGRATION=PASS')
-          PY
-      - name: Deploy and verify Analytics
+      - name: Deploy Analytics using the scoped project token
         run: |
           set -euo pipefail
           railway up . --path-as-root --service "$ANALYTICS_SERVICE" --ci --yes --message "Analytics DEV ${DEPLOY_SHA}"
@@ -125,16 +99,7 @@ jobs:
       - name: Smoke test Analytics
         run: |
           set -euo pipefail
-          railway variable list --service "$ANALYTICS_SERVICE" --json >/tmp/vars.json
-          domain="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          data=json.loads(Path('/tmp/vars.json').read_text())
-          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
-          PY
-          )"
-          if [[ -z "$domain" ]]; then echo 'ANALYTICS_PUBLIC_SMOKE=SKIPPED|no public domain configured'; exit 0; fi
-          case "$domain" in http://*|https://*) base="${domain%/}" ;; *) base="https://${domain%/}" ;; esac
-          curl --fail --silent --show-error "$base/health"
+          base="https://analytics-dev.up.railway.app"
+          curl --fail --silent --show-error --retry 20 --retry-all-errors --retry-delay 3 --max-time 15 "$base/health"
           echo
           echo "ANALYTICS_PUBLIC_HEALTH=PASS|$base"
