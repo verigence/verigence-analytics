@@ -109,37 +109,26 @@ discounts AS (
     SELECT row_data->>'journey_id' AS journey_id,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric),0) AS actual_discount_amount,
            COALESCE(sum(NULLIF(row_data->>'standard_eligible_amount','')::numeric),0) AS eligible_discount_amount,
-           COALESCE(sum(
-               GREATEST(
-                   NULLIF(row_data->>'actual_discount_amount','')::numeric -
-                   CASE
-                       WHEN row_data->>'discount_key'='OTHER_SCHEME' AND EXISTS (
-                           SELECT 1 FROM analytics.snapshot_rows mr
-                           WHERE mr.tenant_id=:tenant_id AND mr.dump_id=:dump_id
-                             AND mr.source_table='p2_management_referrals'
-                             AND mr.row_data->>'journey_id'=row_data->>'journey_id'
-                             AND COALESCE(NULLIF(mr.row_data->>'opted','')::boolean,false)
-                       ) THEN NULL
-                       WHEN NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
-                           THEN NULLIF(row_data->>'standard_eligible_amount','')::numeric
-                       WHEN upper(COALESCE(row_data->>'eligibility_result',''))='NOT_ELIGIBLE'
-                            OR row_data->>'discount_key'='ADDITIONAL_DISCOUNT' THEN 0
-                       ELSE NULL
-                   END,
-                   0
-               )
-           ) FILTER (WHERE NULLIF(row_data->>'actual_discount_amount','')::numeric IS NOT NULL
-                     AND NOT (row_data->>'discount_key'='OTHER_SCHEME' AND EXISTS (
-                           SELECT 1 FROM analytics.snapshot_rows mr
-                           WHERE mr.tenant_id=:tenant_id AND mr.dump_id=:dump_id
-                             AND mr.source_table='p2_management_referrals'
-                             AND mr.row_data->>'journey_id'=row_data->>'journey_id'
-                             AND COALESCE(NULLIF(mr.row_data->>'opted','')::boolean,false)
-                       ))
-                     AND (NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
-                          OR upper(COALESCE(row_data->>'eligibility_result',''))='NOT_ELIGIBLE'
-                          OR row_data->>'discount_key'='ADDITIONAL_DISCOUNT')),
-               0) AS excess_discount_amount,
+           COALESCE(sum(CASE
+               WHEN NULLIF(row_data->>'actual_discount_amount','')::numeric IS NULL THEN 0
+               WHEN row_data->>'discount_key'='OTHER_SCHEME' AND EXISTS (
+                   SELECT 1 FROM analytics.snapshot_rows mr
+                   WHERE mr.tenant_id=:tenant_id AND mr.dump_id=:dump_id
+                     AND mr.source_table='p2_management_referrals'
+                     AND mr.row_data->>'journey_id'=row_data->>'journey_id'
+                     AND COALESCE(NULLIF(mr.row_data->>'opted','')::boolean,false)
+               ) THEN 0
+               WHEN NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
+                    AND NULLIF(row_data->>'actual_discount_amount','')::numeric
+                        - NULLIF(row_data->>'standard_eligible_amount','')::numeric > 100
+                   THEN NULLIF(row_data->>'actual_discount_amount','')::numeric
+                        - NULLIF(row_data->>'standard_eligible_amount','')::numeric
+               WHEN (upper(COALESCE(row_data->>'eligibility_result',''))='NOT_ELIGIBLE'
+                     OR row_data->>'discount_key'='ADDITIONAL_DISCOUNT')
+                    AND NULLIF(row_data->>'actual_discount_amount','')::numeric > 100
+                   THEN NULLIF(row_data->>'actual_discount_amount','')::numeric
+               ELSE 0
+           END),0) AS excess_discount_amount,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key'='CASH_DISCOUNT'), 0) AS dk_cash_discount,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key'='EXCHANGE_BONUS'), 0) AS dk_exchange_bonus,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key' IN ('SCRAPPAGE_BONUS_DEALER','SCRAPPAGE_BONUS_COD')), 0) AS dk_scrappage,
