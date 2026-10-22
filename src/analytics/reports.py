@@ -127,13 +127,19 @@ def finance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_re
     with analytics_engine().connect() as connection:
         latest = _latest_dump(connection, tenant_id)
         rows = _query_rows(connection, """
-            SELECT COALESCE(row_data->>'finance_type_code','UNSPECIFIED') AS finance_type,
-                   COALESCE(row_data->>'provider_name','UNSPECIFIED') AS provider,
+            SELECT COALESCE(f.row_data->>'finance_type_code','UNSPECIFIED') AS finance_type,
+                   COALESCE(f.row_data->>'provider_name','UNSPECIFIED') AS provider,
                    count(*)::int AS deal_count,
-                   count(DISTINCT row_data->>'journey_id')::int AS journey_count,
-                   COALESCE(sum(NULLIF(row_data->>'financed_amount','')::numeric),0) AS financed_amount
-            FROM analytics.snapshot_rows
-            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='finance_records'
+                   count(DISTINCT f.row_data->>'journey_id')::int AS journey_count,
+                   COALESCE(sum(NULLIF(f.row_data->>'financed_amount','')::numeric),0) AS financed_amount
+            FROM analytics.snapshot_rows f
+            WHERE f.tenant_id=:tenant_id AND f.dump_id=:dump_id AND f.source_table='finance_records'
+              AND EXISTS (
+                  SELECT 1 FROM analytics.snapshot_rows b
+                  WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                    AND b.source_table='bookings'
+                    AND b.row_data->>'journey_id'=f.row_data->>'journey_id'
+              )
             GROUP BY 1,2 ORDER BY deal_count DESC, finance_type, provider
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
         summary_rows = _query_rows(connection, """
@@ -147,16 +153,18 @@ def finance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_re
                 WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='finance_records'
             ), finance_totals AS (
                 SELECT count(*)::int AS finance_record_count,
-                       COALESCE(sum(NULLIF(row_data->>'financed_amount','')::numeric),0)
+                       count(DISTINCT f.row_data->>'journey_id')::int AS financed_journeys,
+                       COALESCE(sum(NULLIF(f.row_data->>'financed_amount','')::numeric),0)
                            AS financed_amount
-                FROM analytics.snapshot_rows
-                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
-                  AND source_table='finance_records'
+                FROM analytics.snapshot_rows f
+                JOIN booked b ON b.journey_id=f.row_data->>'journey_id'
+                WHERE f.tenant_id=:tenant_id AND f.dump_id=:dump_id
+                  AND f.source_table='finance_records'
             )
             SELECT (SELECT count(*)::int FROM booked) AS booked_journeys,
                    (SELECT count(*)::int FROM booked b JOIN financed f USING (journey_id))
                        AS financed_bookings,
-                   (SELECT count(*)::int FROM financed) AS financed_journeys,
+                   ft.financed_journeys,
                    ft.finance_record_count,
                    ft.financed_amount,
                    round(100.0 * (SELECT count(*) FROM booked b JOIN financed f USING (journey_id))
