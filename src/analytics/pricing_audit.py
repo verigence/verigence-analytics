@@ -385,7 +385,9 @@ def pricing_integrity_report(
             "known_excess_discount": (
                 "Per application, actual discount less its captured entitlement, floored at zero. "
                 "Applications without a known entitlement, including unattributed management-referral "
-                "amounts, are excluded and counted as unknown. A line exception uses Audit Core's ₹100 tolerance."
+                "amounts, are excluded and counted as unknown. Overages summarize the latest captured "
+                "applications; unresolved status is shown separately from current Audit Core findings. "
+                "A line exception uses Audit Core's ₹100 tolerance."
             ),
             "price_line_coverage": (
                 "Commercial component rows with both a standard and current actual divided by rows with a "
