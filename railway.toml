@@ -2,7 +2,7 @@
 builder = "RAILPACK"
 
 [deploy]
-preDeployCommand = ["alembic upgrade head"]
+preDeployCommand = ["python scripts/prepare_analytics_deploy.py"]
 startCommand = "sh -c 'uvicorn analytics.main:app --host 0.0.0.0 --port ${PORT:-8000}'"
 healthcheckPath = "/health"
 healthcheckTimeout = 100
