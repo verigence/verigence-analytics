@@ -297,6 +297,7 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
         summary = _query_rows(connection, """
             WITH jny AS (
                 SELECT
+                    COALESCE(NULLIF(row_data->>'created_by_actor_id',''), NULLIF(row_data->>'created_by_display_name',''), 'Unknown') AS employee_key,
                     COALESCE(NULLIF(row_data->>'created_by_display_name',''), NULLIF(row_data->>'created_by_actor_id',''), 'Unknown') AS employee_name,
                     NULLIF(row_data->>'created_by_actor_id','') AS actor_id,
                     row_data->>'journey_id' AS journey_id,
@@ -319,7 +320,7 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
                 WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='deliveries'
             )
             SELECT
-                j.employee_name,
+                COALESCE(NULLIF(max(j.employee_name),''), 'Unknown') AS employee_name,
                 j.actor_id,
                 count(DISTINCT j.journey_id)::int                               AS journeys_created,
                 count(DISTINCT b.journey_id)::int                               AS bookings,
@@ -341,7 +342,7 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
             FROM jny j
             LEFT JOIN bkg b ON b.journey_id = j.journey_id
             LEFT JOIN dlv d ON d.journey_id = j.journey_id
-            GROUP BY j.employee_name, j.actor_id
+            GROUP BY j.employee_key, j.actor_id
             ORDER BY journeys_created DESC
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
 
