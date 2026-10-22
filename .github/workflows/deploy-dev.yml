@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
       ANALYTICS_SERVICE: analytics
@@ -43,11 +43,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
-          env -u RAILWAY_TOKEN railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/tmp/link.json
-          env -u RAILWAY_TOKEN railway status --json >/tmp/status.json
-          env -u RAILWAY_TOKEN railway service list --json >/tmp/services.json
-          env -u RAILWAY_TOKEN railway variable list --service "$ANALYTICS_SERVICE" --json >/tmp/vars.json
+          [ -n "${RAILWAY_TOKEN:-}" ] || { echo '::error::RAILWAY_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --service "$ANALYTICS_SERVICE" --json >/tmp/link.json
+          railway status --json >/tmp/status.json
+          railway service list --json >/tmp/services.json
+          railway variable list --service "$ANALYTICS_SERVICE" --json >/tmp/vars.json
           python - <<'PY'
           import json, os
           from pathlib import Path
@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
           import os
           from sqlalchemy import create_engine, text
           url=os.environ['ANALYTICS_DB_URL']
@@ -90,8 +90,8 @@ jobs:
               journey_count=conn.execute(text("SELECT count(*) FROM auditcore.journeys")).scalar_one()
               print(f'ANALYTICS_DB_SOURCE=PASS|database={database_name}|auditcore_journeys={journey_count}')
           PY
-          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" alembic upgrade head
-          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
+          railway run --service "$ANALYTICS_SERVICE" alembic upgrade head
+          railway run --service "$ANALYTICS_SERVICE" python - <<'PY'
           import os
           from sqlalchemy import create_engine, text
           url=os.environ['ANALYTICS_DB_URL']
@@ -115,17 +115,17 @@ jobs:
       - name: Deploy and verify Analytics
         run: |
           set -euo pipefail
-          env -u RAILWAY_TOKEN railway up . --path-as-root --service "$ANALYTICS_SERVICE" --ci --yes --message "Analytics DEV ${DEPLOY_SHA}"
+          railway up . --path-as-root --service "$ANALYTICS_SERVICE" --ci --yes --message "Analytics DEV ${DEPLOY_SHA}"
           echo "ANALYTICS_DEPLOYMENT=PASS"
       - name: Railway failure diagnostics
         if: failure()
         run: |
-          env -u RAILWAY_TOKEN railway logs --service "$ANALYTICS_SERVICE" --build --lines 220 || true
-          env -u RAILWAY_TOKEN railway logs --service "$ANALYTICS_SERVICE" --deployment --lines 220 || true
+          railway logs --service "$ANALYTICS_SERVICE" --build --lines 220 || true
+          railway logs --service "$ANALYTICS_SERVICE" --deployment --lines 220 || true
       - name: Smoke test Analytics
         run: |
           set -euo pipefail
-          env -u RAILWAY_TOKEN railway variable list --service "$ANALYTICS_SERVICE" --json >/tmp/vars.json
+          railway variable list --service "$ANALYTICS_SERVICE" --json >/tmp/vars.json
           domain="$(python - <<'PY'
           import json
           from pathlib import Path
