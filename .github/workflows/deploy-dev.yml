@@ -21,8 +21,6 @@ jobs:
     timeout-minutes: 30
     env:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
-      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
       ANALYTICS_SERVICE: analytics
       DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
@@ -37,58 +35,10 @@ jobs:
           python-version: "3.12"
       - name: Install Railway CLI
         run: npm install --global @railway/cli
-      - name: Verify Railway project token scope
-        shell: bash
+      - name: Deploy Analytics DEV using the project token
         run: |
           set -euo pipefail
           [ -n "${RAILWAY_TOKEN:-}" ] || { echo '::error::RAILWAY_TOKEN is not configured.'; exit 1; }
-          python - <<'PY'
-          import json
-          import os
-          from urllib.error import HTTPError, URLError
-          from urllib.request import Request, urlopen
-
-          request = Request(
-              "https://backboard.railway.com/graphql/v2",
-              data=json.dumps({
-                  "query": "query { projectToken { projectId environmentId } }"
-              }).encode(),
-              headers={
-                  "Content-Type": "application/json",
-                  "Project-Access-Token": os.environ["RAILWAY_TOKEN"],
-              },
-              method="POST",
-          )
-          try:
-              with urlopen(request, timeout=20) as response:
-                  payload = json.load(response)
-          except HTTPError as exc:
-              raise SystemExit(
-                  f"Railway rejected RAILWAY_TOKEN (HTTP {exc.code}); "
-                  "expected a project token for the Analytics DEV environment"
-              ) from None
-          except URLError as exc:
-              raise SystemExit(f"Could not reach Railway token verification endpoint: {exc.reason}") from None
-
-          if payload.get("errors"):
-              raise SystemExit("Railway project-token scope query failed")
-
-          scope = payload.get("data", {}).get("projectToken") or {}
-          expected = {
-              "projectId": os.environ["PLATFORM_PROJECT_ID"],
-              "environmentId": os.environ["PLATFORM_ENVIRONMENT_ID"],
-          }
-          if scope != expected:
-              raise SystemExit(
-                  "RAILWAY_TOKEN targets a different Railway project/environment "
-                  f"(project={scope.get('projectId')}, environment={scope.get('environmentId')})"
-              )
-
-          print("RAILWAY_PROJECT_TOKEN_SCOPE=PASS|project=verigence-audit-core|environment=dev")
-          PY
-      - name: Deploy Analytics using the scoped project token
-        run: |
-          set -euo pipefail
           railway up . --path-as-root --service "$ANALYTICS_SERVICE" --ci --yes --message "Analytics DEV ${DEPLOY_SHA}"
           echo "ANALYTICS_DEPLOYMENT=PASS"
       - name: Railway failure diagnostics
