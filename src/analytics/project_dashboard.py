@@ -486,4 +486,4 @@ def project_dashboard(
         "accessories": accessories,
         "price_integrity": price_integrity,
     }
-   
+
