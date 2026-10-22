@@ -23,9 +23,9 @@ jobs:
       - name: Install
         run: python -m pip install -e '.[test,lint]'
       - name: Compile
-        run: python -m compileall -q src tests migrations scripts
+        run: python -m compileall -q src tests migrations scripts/prepare_analytics_deploy.py
       - name: Ruff
-        run: ruff check src tests migrations scripts
+        run: ruff check src tests migrations scripts/prepare_analytics_deploy.py
       - name: Tests
         run: pytest -q
       - name: Alembic single head
