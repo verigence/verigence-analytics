@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import text
 
 from analytics.db import analytics_engine
+from analytics.pricing_audit import pricing_integrity_report
 from analytics.reports import _latest_dump
 from analytics.security import Principal, require_analytics_read
 
@@ -108,17 +109,50 @@ discounts AS (
     SELECT row_data->>'journey_id' AS journey_id,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric),0) AS actual_discount_amount,
            COALESCE(sum(NULLIF(row_data->>'standard_eligible_amount','')::numeric),0) AS eligible_discount_amount,
+           COALESCE(sum(CASE
+               WHEN NULLIF(row_data->>'actual_discount_amount','')::numeric IS NULL THEN 0
+               WHEN row_data->>'discount_key'='OTHER_SCHEME' AND EXISTS (
+                   SELECT 1 FROM analytics.snapshot_rows mr
+                   WHERE mr.tenant_id=:tenant_id AND mr.dump_id=:dump_id
+                     AND mr.source_table='p2_management_referrals'
+                     AND mr.row_data->>'journey_id'=row_data->>'journey_id'
+                     AND COALESCE(NULLIF(mr.row_data->>'opted','')::boolean,false)
+               ) THEN 0
+               WHEN NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
+                    AND NULLIF(row_data->>'actual_discount_amount','')::numeric
+                        - NULLIF(row_data->>'standard_eligible_amount','')::numeric > 100
+                   THEN NULLIF(row_data->>'actual_discount_amount','')::numeric
+                        - NULLIF(row_data->>'standard_eligible_amount','')::numeric
+               WHEN (upper(COALESCE(row_data->>'eligibility_result',''))='NOT_ELIGIBLE'
+                     OR row_data->>'discount_key'='ADDITIONAL_DISCOUNT')
+                    AND NULLIF(row_data->>'actual_discount_amount','')::numeric > 100
+                   THEN NULLIF(row_data->>'actual_discount_amount','')::numeric
+               ELSE 0
+           END),0) AS excess_discount_amount,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key'='CASH_DISCOUNT'), 0) AS dk_cash_discount,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key'='EXCHANGE_BONUS'), 0) AS dk_exchange_bonus,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key' IN ('SCRAPPAGE_BONUS_DEALER','SCRAPPAGE_BONUS_COD')), 0) AS dk_scrappage,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key'='CORPORATE_PRIVILEGE'), 0) AS dk_corporate,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key'='MANAGEMENT_REFERRAL'), 0) AS dk_mr,
            COALESCE(sum(NULLIF(row_data->>'actual_discount_amount','')::numeric) FILTER (WHERE row_data->>'discount_key' IN ('OTHER_SCHEME','ADDITIONAL_DISCOUNT')), 0) AS dk_other,
-           bool_or(
+           COALESCE(bool_or(
                NULLIF(row_data->>'actual_discount_amount','')::numeric IS NOT NULL
-               AND NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
-               AND NULLIF(row_data->>'actual_discount_amount','')::numeric > NULLIF(row_data->>'standard_eligible_amount','')::numeric
-           ) AS has_excess_discount
+               AND NOT (row_data->>'discount_key'='OTHER_SCHEME' AND EXISTS (
+                   SELECT 1 FROM analytics.snapshot_rows mr
+                   WHERE mr.tenant_id=:tenant_id AND mr.dump_id=:dump_id
+                     AND mr.source_table='p2_management_referrals'
+                     AND mr.row_data->>'journey_id'=row_data->>'journey_id'
+                     AND COALESCE(NULLIF(mr.row_data->>'opted','')::boolean,false)
+               ))
+               AND NULLIF(row_data->>'actual_discount_amount','')::numeric >
+                   CASE
+                       WHEN NULLIF(row_data->>'standard_eligible_amount','')::numeric IS NOT NULL
+                           THEN NULLIF(row_data->>'standard_eligible_amount','')::numeric
+                       WHEN upper(COALESCE(row_data->>'eligibility_result',''))='NOT_ELIGIBLE'
+                            OR row_data->>'discount_key'='ADDITIONAL_DISCOUNT' THEN 0
+                       ELSE NULL
+                   END + 100
+           ),false) AS has_excess_discount
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='discount_applications'
     GROUP BY 1
@@ -163,6 +197,7 @@ deal_facts AS (
            p.model_name,
            p.variant_name,
            (dl.journey_id IS NOT NULL) AS has_delivery_record,
+           (b.journey_id IS NOT NULL) AS has_booking,
            dl.actual_delivered_at,
            (dl.actual_delivered_at IS NOT NULL) AS is_delivered,
            CASE WHEN b.booking_date IS NOT NULL AND dl.actual_delivered_at IS NOT NULL AND dl.actual_delivered_at::date >= b.booking_date
@@ -186,8 +221,8 @@ deal_facts AS (
            COALESCE(a.accessories_value, 0) AS accessories_value,
            COALESCE(di.actual_discount_amount, 0) AS actual_discount_amount,
            COALESCE(di.eligible_discount_amount, 0) AS eligible_discount_amount,
-           GREATEST(COALESCE(di.actual_discount_amount,0) - COALESCE(di.eligible_discount_amount,0), 0) AS excess_discount_amount,
-           (COALESCE(di.actual_discount_amount,0) > COALESCE(di.eligible_discount_amount,0)) AS is_excess_discount,
+           COALESCE(di.excess_discount_amount,0) AS excess_discount_amount,
+           COALESCE(di.has_excess_discount,false) AS is_excess_discount,
            COALESCE(di.dk_cash_discount, 0) AS dk_cash_discount,
            COALESCE(di.dk_exchange_bonus, 0) AS dk_exchange_bonus,
            COALESCE(di.dk_scrappage, 0) AS dk_scrappage,
@@ -235,7 +270,8 @@ def project_dashboard(
         summary_sql = _PROJECT_AUDITOR_CTE + """
         SELECT
             count(*)::int AS total_journeys,
-            count(*) FILTER (WHERE is_delivered)::int AS delivered_cars,
+            count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
+            count(*) FILTER (WHERE has_booking AND is_delivered)::int AS delivered_cars,
             count(*) FILTER (WHERE has_delivery_record)::int AS delivery_records,
             COALESCE(sum(eligible_discount_amount), 0) AS total_standard_discount,
             COALESCE(sum(actual_discount_amount), 0) AS total_actual_discount,
@@ -249,19 +285,24 @@ def project_dashboard(
             COALESCE(sum(dk_corporate), 0) AS total_corporate_discount,
             COALESCE(sum(dk_mr), 0) AS total_mr_discount,
             COALESCE(sum(dk_other), 0) AS total_other_discount,
-            count(*) FILTER (WHERE has_insurance)::int AS insured_journeys,
-            count(*) FILTER (WHERE is_inhouse_insurance)::int AS inhouse_insurance_journeys,
-            count(*) FILTER (WHERE is_outside_insurance)::int AS outside_insurance_journeys,
-            COALESCE(sum(insurance_premium_amount), 0) AS total_insurance_premium,
-            count(*) FILTER (WHERE has_accessories)::int AS accessory_journeys,
-            COALESCE(sum(accessories_value), 0) AS total_accessories_value,
-            count(*) FILTER (WHERE has_ew)::int AS ew_journeys,
-            COALESCE(sum(ew_value), 0) AS total_ew_value,
-            count(*) FILTER (WHERE has_rsa)::int AS rsa_journeys,
-            COALESCE(sum(rsa_value), 0) AS total_rsa_value,
+            count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insured_journeys,
+            count(*) FILTER (WHERE has_booking AND is_inhouse_insurance)::int AS inhouse_insurance_journeys,
+            count(*) FILTER (WHERE has_booking AND is_outside_insurance)::int AS outside_insurance_journeys,
+            COALESCE(sum(insurance_premium_amount) FILTER (WHERE has_booking), 0) AS total_insurance_premium,
+            count(*) FILTER (WHERE has_booking AND has_accessories)::int AS accessory_journeys,
+            COALESCE(sum(accessories_value) FILTER (WHERE has_booking), 0) AS total_accessories_value,
+            count(*) FILTER (WHERE has_booking AND has_ew)::int AS ew_journeys,
+            COALESCE(sum(ew_value) FILTER (WHERE has_booking), 0) AS total_ew_value,
+            count(*) FILTER (WHERE has_booking AND has_rsa)::int AS rsa_journeys,
+            COALESCE(sum(rsa_value) FILTER (WHERE has_booking), 0) AS total_rsa_value,
             count(*) FILTER (WHERE has_trade_in)::int AS trade_in_journeys,
             COALESCE(sum(trade_in_value), 0) AS total_trade_in_value,
             count(*) FILTER (WHERE has_finance)::int AS finance_journeys,
+            count(*) FILTER (WHERE has_booking AND has_finance)::int AS financed_bookings,
+            CASE WHEN count(*) FILTER (WHERE has_booking) > 0
+                 THEN round(100.0 * count(*) FILTER (WHERE has_booking AND has_finance)
+                            / count(*) FILTER (WHERE has_booking), 1)
+                 ELSE NULL END AS finance_attach_pct,
             COALESCE(sum(payment_amount), 0) AS total_payment_collected,
             COALESCE(sum(booking_payment_amount), 0) AS booking_payment_collected,
             COALESCE(sum(delivery_payment_amount), 0) AS delivery_payment_collected,
@@ -279,8 +320,8 @@ def project_dashboard(
         SELECT
             dealer_id,
             dealer_name,
-            count(*)::int AS booked_cars,
-            count(*) FILTER (WHERE is_delivered)::int AS delivered_cars,
+            count(*) FILTER (WHERE has_booking)::int AS booked_cars,
+            count(*) FILTER (WHERE has_booking AND is_delivered)::int AS delivered_cars,
             COALESCE(sum(eligible_discount_amount), 0) AS standard_discount,
             COALESCE(sum(actual_discount_amount), 0) AS actual_discount,
             COALESCE(sum(excess_discount_amount), 0) AS excess_discount,
@@ -314,8 +355,8 @@ def project_dashboard(
             outlet_name,
             city,
             state_region,
-            count(*)::int AS booked_cars,
-            count(*) FILTER (WHERE is_delivered)::int AS delivered_cars,
+            count(*) FILTER (WHERE has_booking)::int AS booked_cars,
+            count(*) FILTER (WHERE has_booking AND is_delivered)::int AS delivered_cars,
             COALESCE(sum(eligible_discount_amount), 0) AS standard_discount,
             COALESCE(sum(actual_discount_amount), 0) AS actual_discount,
             COALESCE(sum(excess_discount_amount), 0) AS excess_discount,
@@ -344,8 +385,8 @@ def project_dashboard(
         model_sql = _PROJECT_AUDITOR_CTE + """
         SELECT
             model_name,
-            count(*)::int AS booked_units,
-            count(*) FILTER (WHERE is_delivered)::int AS delivered_units,
+            count(*) FILTER (WHERE has_booking)::int AS booked_units,
+            count(*) FILTER (WHERE has_booking AND is_delivered)::int AS delivered_units,
             COALESCE(sum(eligible_discount_amount), 0) AS standard_discount,
             COALESCE(sum(actual_discount_amount), 0) AS actual_discount,
             COALESCE(sum(excess_discount_amount), 0) AS excess_discount,
@@ -366,13 +407,13 @@ def project_dashboard(
             customer_pincode,
             dealer_name,
             outlet_name,
-            count(*)::int AS car_count,
-            count(*) FILTER (WHERE is_delivered)::int AS delivered_count,
+            count(*) FILTER (WHERE has_booking)::int AS car_count,
+            count(*) FILTER (WHERE has_booking AND is_delivered)::int AS delivered_count,
             COALESCE(sum(actual_discount_amount), 0) AS total_discount,
             COALESCE(sum(excess_discount_amount), 0) AS excess_discount,
             COALESCE(sum(payment_amount), 0) AS payment_collected
         FROM deal_facts
-        WHERE customer_pincode IS NOT NULL
+        WHERE customer_pincode IS NOT NULL AND has_booking
         GROUP BY customer_pincode, dealer_name, outlet_name
         ORDER BY car_count DESC, customer_pincode
         LIMIT 100
@@ -407,17 +448,31 @@ def project_dashboard(
         # 7. Accessories Breakdown by Type
         accessories_sql = """
         SELECT
-            upper(COALESCE(row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
+            upper(COALESCE(a.row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
             count(*)::int AS record_count,
-            count(DISTINCT row_data->>'journey_id')::int AS journey_count,
-            COALESCE(sum(NULLIF(row_data->>'actual_amount','')::numeric), 0) AS actual_amount,
-            round(avg(NULLIF(row_data->>'actual_amount','')::numeric), 2) AS avg_amount
-        FROM analytics.snapshot_rows
-        WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journey_addons'
+            count(DISTINCT a.row_data->>'journey_id')::int AS journey_count,
+            COALESCE(sum(NULLIF(a.row_data->>'actual_amount','')::numeric), 0) AS actual_amount,
+            round(avg(NULLIF(a.row_data->>'actual_amount','')::numeric), 2) AS avg_amount
+        FROM analytics.snapshot_rows a
+        WHERE a.tenant_id=:tenant_id AND a.dump_id=:dump_id AND a.source_table='journey_addons'
+          AND EXISTS (
+              SELECT 1 FROM analytics.snapshot_rows b
+              WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                AND b.source_table='bookings'
+                AND b.row_data->>'journey_id'=a.row_data->>'journey_id'
+          )
         GROUP BY 1
         ORDER BY actual_amount DESC, addon_type
         """
         accessories = [dict(r) for r in connection.execute(text(accessories_sql), params).mappings()]
+        price_integrity = pricing_integrity_report(
+            connection,
+            tenant_id=tenant_id,
+            dump_id=latest["dump_id"],
+            total_journeys=int(summary.get("total_journeys") or 0),
+        )
+        summary["total_excess_discount"] = price_integrity["summary"]["known_excess_discount_amount"]
+        summary["journeys_with_excess_discount"] = price_integrity["summary"]["known_excess_discount_journeys"]
 
     return {
         "tenant_id": tenant_id,
@@ -429,4 +484,6 @@ def project_dashboard(
         "pincodes": pincodes,
         "discount_schemes": schemes,
         "accessories": accessories,
+        "price_integrity": price_integrity,
     }
+

@@ -127,15 +127,56 @@ def finance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_re
     with analytics_engine().connect() as connection:
         latest = _latest_dump(connection, tenant_id)
         rows = _query_rows(connection, """
-            SELECT COALESCE(row_data->>'finance_type_code','UNSPECIFIED') AS finance_type,
-                   COALESCE(row_data->>'provider_name','UNSPECIFIED') AS provider,
+            SELECT COALESCE(f.row_data->>'finance_type_code','UNSPECIFIED') AS finance_type,
+                   COALESCE(f.row_data->>'provider_name','UNSPECIFIED') AS provider,
                    count(*)::int AS deal_count,
-                   COALESCE(sum(NULLIF(row_data->>'financed_amount','')::numeric),0) AS financed_amount
-            FROM analytics.snapshot_rows
-            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='finance_records'
+                   count(DISTINCT f.row_data->>'journey_id')::int AS journey_count,
+                   COALESCE(sum(NULLIF(f.row_data->>'financed_amount','')::numeric),0) AS financed_amount
+            FROM analytics.snapshot_rows f
+            WHERE f.tenant_id=:tenant_id AND f.dump_id=:dump_id AND f.source_table='finance_records'
+              AND EXISTS (
+                  SELECT 1 FROM analytics.snapshot_rows b
+                  WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                    AND b.source_table='bookings'
+                    AND b.row_data->>'journey_id'=f.row_data->>'journey_id'
+              )
             GROUP BY 1,2 ORDER BY deal_count DESC, finance_type, provider
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
-    return {"tenant_id": tenant_id, "data_as_of": latest["data_as_of_utc"], "rows": rows}
+        summary_rows = _query_rows(connection, """
+            WITH booked AS (
+                SELECT DISTINCT row_data->>'journey_id' AS journey_id
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
+            ), financed AS (
+                SELECT DISTINCT row_data->>'journey_id' AS journey_id
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='finance_records'
+            ), finance_totals AS (
+                SELECT count(*)::int AS finance_record_count,
+                       count(DISTINCT f.row_data->>'journey_id')::int AS financed_journeys,
+                       COALESCE(sum(NULLIF(f.row_data->>'financed_amount','')::numeric),0)
+                           AS financed_amount
+                FROM analytics.snapshot_rows f
+                JOIN booked b ON b.journey_id=f.row_data->>'journey_id'
+                WHERE f.tenant_id=:tenant_id AND f.dump_id=:dump_id
+                  AND f.source_table='finance_records'
+            )
+            SELECT (SELECT count(*)::int FROM booked) AS booked_journeys,
+                   (SELECT count(*)::int FROM booked b JOIN financed f USING (journey_id))
+                       AS financed_bookings,
+                   ft.financed_journeys,
+                   ft.finance_record_count,
+                   ft.financed_amount,
+                   round(100.0 * (SELECT count(*) FROM booked b JOIN financed f USING (journey_id))
+                         / NULLIF((SELECT count(*) FROM booked),0),1) AS finance_attach_pct
+            FROM finance_totals ft
+            """, tenant_id=tenant_id, dump_id=latest["dump_id"])
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "summary": summary_rows[0] if summary_rows else {},
+        "rows": rows,
+    }
 
 
 @router.get("/insurance")
@@ -256,8 +297,9 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
         summary = _query_rows(connection, """
             WITH jny AS (
                 SELECT
-                    COALESCE(NULLIF(row_data->>'created_by_display_name',''), row_data->>'created_by_actor_id', 'Unknown') AS employee_name,
-                    row_data->>'created_by_actor_id' AS actor_id,
+                    COALESCE(NULLIF(row_data->>'created_by_actor_id',''), NULLIF(row_data->>'created_by_display_name',''), 'Unknown') AS employee_key,
+                    COALESCE(NULLIF(row_data->>'created_by_display_name',''), NULLIF(row_data->>'created_by_actor_id',''), 'Unknown') AS employee_name,
+                    NULLIF(row_data->>'created_by_actor_id','') AS actor_id,
                     row_data->>'journey_id' AS journey_id,
                     NULLIF(row_data->>'created_at_utc','')::timestamptz AS journey_created_at
                 FROM analytics.snapshot_rows
@@ -278,7 +320,7 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
                 WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='deliveries'
             )
             SELECT
-                j.employee_name,
+                COALESCE(NULLIF(max(j.employee_name),''), 'Unknown') AS employee_name,
                 j.actor_id,
                 count(DISTINCT j.journey_id)::int                               AS journeys_created,
                 count(DISTINCT b.journey_id)::int                               AS bookings,
@@ -300,45 +342,39 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
             FROM jny j
             LEFT JOIN bkg b ON b.journey_id = j.journey_id
             LEFT JOIN dlv d ON d.journey_id = j.journey_id
-            GROUP BY j.employee_name, j.actor_id
+            GROUP BY j.employee_key, j.actor_id
             ORDER BY journeys_created DESC
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
 
-        # Per-journey detail row for the table
-        journeys = _query_rows(connection, """
-            SELECT
-                j.row_data->>'journey_reference'           AS journey_ref,
-                COALESCE(NULLIF(j.row_data->>'created_by_display_name',''), j.row_data->>'created_by_actor_id','Unknown') AS employee_name,
-                NULLIF(j.row_data->>'created_at_utc','')::timestamptz::date  AS created_date,
-                NULLIF(b.row_data->>'booking_date','')::date                 AS booking_date,
-                NULLIF(b.row_data->>'booking_reference','')                  AS booking_ref,
-                d.row_data->>'actual_delivery_status_code'                   AS delivery_status,
-                NULLIF(d.row_data->>'actual_delivered_at','')::timestamptz::date AS delivered_date,
-                CASE
-                    WHEN NULLIF(d.row_data->>'actual_delivered_at','') IS NOT NULL
-                    THEN round(EXTRACT(EPOCH FROM (
-                        NULLIF(d.row_data->>'actual_delivered_at','')::timestamptz
-                        - NULLIF(j.row_data->>'created_at_utc','')::timestamptz
-                    )) / 86400.0, 1)::float
-                END AS days_to_delivery
-            FROM analytics.snapshot_rows j
-            LEFT JOIN analytics.snapshot_rows b
-                   ON b.tenant_id=j.tenant_id AND b.dump_id=j.dump_id
-                  AND b.source_table='bookings'
-                  AND b.row_data->>'journey_id'=j.row_data->>'journey_id'
-            LEFT JOIN analytics.snapshot_rows d
-                   ON d.tenant_id=j.tenant_id AND d.dump_id=j.dump_id
-                  AND d.source_table='deliveries'
-                  AND d.row_data->>'journey_id'=j.row_data->>'journey_id'
-            WHERE j.tenant_id=:tenant_id AND j.dump_id=:dump_id AND j.source_table='journeys'
-            ORDER BY j.row_data->>'created_at_utc' DESC
+        upload_activity = _query_rows(connection, """
+            WITH journey_uploads AS (
+                SELECT date_trunc(
+                           'month', NULLIF(row_data->>'created_at_utc','')::timestamptz
+                       )::date AS upload_month,
+                       row_data->>'journey_id' AS journey_id,
+                       COALESCE(
+                           NULLIF(row_data->>'created_by_actor_id',''),
+                           NULLIF(row_data->>'created_by_display_name','')
+                       ) AS creator_key
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journeys'
+                  AND NULLIF(row_data->>'created_at_utc','') IS NOT NULL
+            )
+            SELECT upload_month,
+                   count(DISTINCT journey_id)::int AS journeys_created,
+                   count(DISTINCT creator_key)::int AS attributed_creators,
+                   count(DISTINCT journey_id) FILTER (WHERE creator_key IS NULL)::int
+                       AS unattributed_journeys
+            FROM journey_uploads
+            GROUP BY upload_month
+            ORDER BY upload_month
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
 
     return {
         "tenant_id": tenant_id,
         "data_as_of": latest["data_as_of_utc"],
         "summary": summary,
-        "journeys": journeys,
+        "upload_activity": upload_activity,
     }
 
 
