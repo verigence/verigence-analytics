@@ -13,11 +13,10 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-
 _PRICE_RULES = {"DEAL_UNDERCHARGED", "DEAL_TOTAL_VARIANCE_NEGATIVE"}
 _DISCOUNT_RULE = "EXCESS_DISCOUNT"
 _INVOICE_DISAGREEMENT_RULE = "INVOICE_FIELD_DISAGREEMENT"
-_LINE_TOLERANCE = Decimal("100")
+_LINE_TOLERANCE = Decimal(100)
 _INVOICE_SOURCE_TYPES = {
     "tax_invoice_tally",
     "customer_invoice_dms",
