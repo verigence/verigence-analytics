@@ -10,13 +10,13 @@ os.environ.setdefault("SECURITY_TOKEN_ISSUER", "verigence-security")
 os.environ.setdefault("SECURITY_TOKEN_AUDIENCE", "verigence-platform")
 os.environ.setdefault("ANALYTICS_SECRET_KEY", "test-only-secret")
 
+from analytics import reports
 from analytics.dump import (
     SOURCE_TABLES,
     _copy_derived_accessory_line_items,
     _identifier,
 )
 from analytics.main import create_app
-from analytics import reports
 from analytics.security_authorization import SecurityAuthorizationClient
 
 
