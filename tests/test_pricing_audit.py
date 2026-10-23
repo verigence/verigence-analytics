@@ -54,7 +54,7 @@ def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None
             "price_exception_journeys": 2,
             "discount_exception_journeys": 3,
             "invoice_conflict_journeys": 1,
-            "known_excess_discount_amount": Decimal("1250"),
+            "known_excess_discount_amount": Decimal(1250),
             "unknown_discount_applications": 2,
         },
         {
@@ -63,7 +63,7 @@ def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None
             "price_exception_journeys": 1,
             "discount_exception_journeys": 2,
             "invoice_conflict_journeys": 0,
-            "known_excess_discount_amount": Decimal("750"),
+            "known_excess_discount_amount": Decimal(750),
             "unknown_discount_applications": 4,
         },
         {
@@ -72,7 +72,7 @@ def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None
             "price_exception_journeys": 0,
             "discount_exception_journeys": 0,
             "invoice_conflict_journeys": 1,
-            "known_excess_discount_amount": Decimal("0"),
+            "known_excess_discount_amount": Decimal(0),
             "unknown_discount_applications": 0,
         },
     ]
@@ -84,7 +84,7 @@ def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None
         "price_exception_journeys": 3,
         "discount_exception_journeys": 5,
         "invoice_conflict_journeys": 1,
-        "known_excess_discount_amount": Decimal("2000"),
+        "known_excess_discount_amount": Decimal(2000),
         "unknown_discount_applications": 6,
     }
     assert dealers[1]["dealer_name"] == "Dealer B"
