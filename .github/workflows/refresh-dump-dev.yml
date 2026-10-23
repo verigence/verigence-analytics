@@ -135,6 +135,7 @@ jobs:
                          table_counts->>'dealer_discount_grid_versions' AS grid_versions,
                          table_counts->>'dealer_discount_grid_rows'     AS grid_rows,
                          table_counts->>'p2_management_referrals'       AS mr_referrals,
+                         table_counts->>'derived_accessory_line_items'   AS accessory_lines,
                          table_counts->>'journeys'                      AS journeys,
                          table_counts->>'discount_applications'         AS discounts
                   FROM analytics.dump_runs
@@ -165,6 +166,7 @@ jobs:
                       f"|grid_versions={r['grid_versions']}"
                       f"|grid_rows={r['grid_rows']}"
                       f"|mr_referrals={r['mr_referrals']}"
+                      f"|accessory_lines={r['accessory_lines']}"
                   )
 
               missing = {

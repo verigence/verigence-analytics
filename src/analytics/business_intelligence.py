@@ -70,8 +70,11 @@ staff AS (
 ),
 products AS (
     SELECT row_data->>'journey_id' AS journey_id,
-           NULLIF(row_data->>'model_name_snapshot','') AS model_name,
-           NULLIF(row_data->>'variant_name_snapshot','') AS variant_name,
+           COALESCE(NULLIF(row_data->>'canonical_model_name',''),
+                    NULLIF(row_data->>'model_name_snapshot','')) AS model_name,
+           COALESCE(NULLIF(row_data->>'canonical_variant_name',''),
+                    NULLIF(row_data->>'variant_name_snapshot','')) AS variant_name,
+           NULLIF(row_data->>'canonical_model_name','') IS NOT NULL AS model_catalog_resolved,
            NULLIF(row_data->>'colour_name_snapshot','') AS colour_name
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journey_products'
@@ -105,7 +108,37 @@ insurance AS (
            NULLIF(row_data->>'standard_premium_amount','')::numeric AS standard_premium_amount,
            NULLIF(row_data->>'self_insurance_flag','')::boolean AS self_insurance_flag,
            row_data->'add_ons' AS insurance_add_ons,
-           NULLIF(row_data->>'insurance_source','') AS insurance_source
+           NULLIF(row_data->>'insurance_source','') AS insurance_source,
+           CASE
+               WHEN upper(COALESCE(NULLIF(row_data->>'insurance_source',''),''))='INHOUSE'
+                    AND NULLIF(row_data->>'self_insurance_flag','')::boolean IS TRUE
+                   THEN 'MIXED_OR_UNCLEAR'
+               WHEN upper(COALESCE(NULLIF(row_data->>'insurance_source',''),''))='INHOUSE'
+                   THEN 'DEALER_ARRANGED'
+               WHEN upper(COALESCE(NULLIF(row_data->>'insurance_source',''),''))
+                        IN ('SELF','EXTERNAL','OUTSIDE')
+                    OR NULLIF(row_data->>'self_insurance_flag','')::boolean IS TRUE
+                   THEN 'CUSTOMER_ARRANGED'
+               WHEN regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g')
+                        IN ('DEALER','DLR','DEALERARRANGED','DLRARRANGED')
+                   THEN 'DEALER_ARRANGED'
+               WHEN regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g')
+                        IN ('SELF','OWN','CUSTOMER','DONEBYCUSTOMER',
+                            'CUSTOMERARRANGED','OWNARRANGED')
+                   THEN 'CUSTOMER_ARRANGED'
+               WHEN regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g') LIKE '%OWN%DLR%'
+                 OR regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g') LIKE '%DLR%OWN%'
+                 OR regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g') LIKE '%OWN%DEALER%'
+                 OR regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g') LIKE '%DEALER%OWN%'
+                   THEN 'MIXED_OR_UNCLEAR'
+               ELSE 'UNSPECIFIED'
+           END AS insurance_route
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
 ),
@@ -300,6 +333,7 @@ deal_facts AS (
            s.sales_staff_role,
            p.model_name,
            p.variant_name,
+           COALESCE(p.model_catalog_resolved,false) AS model_catalog_resolved,
            p.colour_name,
            (dl.journey_id IS NOT NULL) AS has_delivery_record,
            dl.delivery_status,
@@ -315,8 +349,9 @@ deal_facts AS (
            i.self_insurance_flag,
            i.insurance_add_ons,
            i.insurance_source,
-           (i.journey_id IS NOT NULL AND i.insurance_source = 'INHOUSE') AS has_inhouse_insurance,
-           (i.journey_id IS NOT NULL AND (i.insurance_source = 'SELF' OR i.self_insurance_flag IS TRUE)) AS has_self_insurance,
+           i.insurance_route,
+           (i.journey_id IS NOT NULL AND i.insurance_route = 'DEALER_ARRANGED') AS has_inhouse_insurance,
+           (i.journey_id IS NOT NULL AND i.insurance_route = 'CUSTOMER_ARRANGED') AS has_self_insurance,
            (t.journey_id IS NOT NULL) AS has_trade_in,
            t.trade_in_quoted_value,
            t.trade_in_actual_value,
@@ -670,6 +705,55 @@ def sales_product(
             ORDER BY journey_count DESC, model_name, variant_name
             """,
         )
+        by_dealer_model_variant = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT dealer_id,
+                   dealer_name,
+                   outlet_id,
+                   outlet_name,
+                   COALESCE(model_name,'Unresolved') AS model_name,
+                   COALESCE(variant_name,'Unresolved') AS variant_name,
+                   count(*) FILTER (WHERE has_booking)::int AS booked_units,
+                   count(*) FILTER (
+                       WHERE has_booking AND actual_delivered_at IS NOT NULL
+                   )::int AS delivered_units
+            FROM deal_facts
+            WHERE has_booking
+            GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
+                     model_name, variant_name
+            ORDER BY booked_units DESC, dealer_name, outlet_name,
+                     model_name, variant_name
+            """,
+        )
+        model_variant_coverage = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                _DEAL_FACTS_CTE
+                + """
+                SELECT count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
+                       count(*) FILTER (
+                           WHERE has_booking AND model_name IS NOT NULL
+                       )::int AS model_labelled_journeys,
+                       count(*) FILTER (
+                           WHERE has_booking AND variant_name IS NOT NULL
+                       )::int AS variant_labelled_journeys,
+                       count(*) FILTER (
+                           WHERE has_booking AND model_catalog_resolved
+                       )::int AS catalogue_mapped_journeys,
+                       count(*) FILTER (
+                           WHERE has_booking
+                             AND (model_name IS NULL OR variant_name IS NULL)
+                       )::int AS unresolved_journeys
+                FROM deal_facts
+                """,
+            )
+        )
         by_colour = _rows(
             connection,
             latest,
@@ -692,7 +776,9 @@ def sales_product(
         "data_as_of": latest["data_as_of_utc"],
         "by_outlet": by_outlet,
         "by_model_variant": by_model,
+        "by_dealer_model_variant": by_dealer_model_variant,
         "by_colour": by_colour,
+        "model_variant_coverage": model_variant_coverage,
         "delivery_definition": {
             "delivery_records": "Journeys with a delivery record",
             "actual_deliveries": "Journeys with actual_delivered_at populated",
@@ -931,6 +1017,46 @@ def discount_intelligence(
             ORDER BY total_actual_discount DESC, dealer_name, outlet_name
             """,
         )
+        by_dealer_model_variant = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT dealer_id,
+                   dealer_name,
+                   outlet_id,
+                   outlet_name,
+                   COALESCE(model_name,'Unresolved') AS model_name,
+                   COALESCE(variant_name,'Unresolved') AS variant_name,
+                   count(*) FILTER (WHERE has_booking)::int AS booked_units,
+                   count(*) FILTER (
+                       WHERE has_booking AND actual_discount_present
+                   )::int AS discounted_units,
+                   COALESCE(sum(actual_discount_amount) FILTER (
+                       WHERE has_booking AND actual_discount_present
+                   ),0) AS actual_discount_amount,
+                   round(avg(actual_discount_amount) FILTER (
+                       WHERE has_booking AND actual_discount_present
+                   ),2) AS avg_discount_per_discounted_unit,
+                   COALESCE(sum(above_eligible_discount_amount) FILTER (
+                       WHERE has_booking
+                   ),0) AS known_excess_discount_amount,
+                   count(*) FILTER (
+                       WHERE has_booking AND has_excess_on_any_key
+                   )::int AS known_excess_units,
+                   count(*) FILTER (
+                       WHERE has_booking AND unknown_entitlement_count > 0
+                   )::int AS units_with_unknown_entitlement
+            FROM deal_facts
+            WHERE has_booking
+            GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
+                     model_name, variant_name
+            ORDER BY known_excess_discount_amount DESC,
+                     actual_discount_amount DESC,
+                     dealer_name, outlet_name, model_name, variant_name
+            """,
+        )
         by_key = _rows(
             connection,
             latest,
@@ -973,6 +1099,7 @@ def discount_intelligence(
         "summary": summary,
         "by_model": by_model,
         "by_outlet": by_outlet,
+        "by_dealer_model_variant": by_dealer_model_variant,
         "by_discount_key": by_key,
         "pricing_integrity": pricing_integrity,
         "above_eligible_definition": (
@@ -1001,9 +1128,19 @@ def insurance_intelligence(
                        count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insurance_journeys,
                        count(*) FILTER (
                            WHERE has_booking AND has_insurance
-                             AND (insurance_source IS NULL
-                                  OR insurance_source NOT IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE'))
-                             AND self_insurance_flag IS NOT TRUE
+                             AND insurance_route='DEALER_ARRANGED'
+                       )::int AS dealer_arranged_journeys,
+                       count(*) FILTER (
+                           WHERE has_booking AND has_insurance
+                             AND insurance_route='CUSTOMER_ARRANGED'
+                       )::int AS customer_arranged_journeys,
+                       count(*) FILTER (
+                           WHERE has_booking AND has_insurance
+                             AND insurance_route='MIXED_OR_UNCLEAR'
+                       )::int AS source_ambiguous_journeys,
+                       count(*) FILTER (
+                           WHERE has_booking AND has_insurance
+                             AND insurance_route='UNSPECIFIED'
                        )::int AS source_unknown_journeys,
                        count(*) FILTER (
                            WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
@@ -1090,6 +1227,26 @@ def insurance_intelligence(
             ORDER BY policy_count DESC, insurance_by
             """,
         )
+        by_route = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT insurance_route AS route,
+                   count(*)::int AS policy_count,
+                   count(*) FILTER (WHERE actual_premium_amount IS NOT NULL)::int
+                       AS premium_populated,
+                   COALESCE(sum(actual_premium_amount),0) AS premium_amount,
+                   round(avg(actual_premium_amount) FILTER (
+                       WHERE actual_premium_amount IS NOT NULL
+                   ),2) AS avg_premium
+            FROM deal_facts
+            WHERE has_booking AND has_insurance
+            GROUP BY insurance_route
+            ORDER BY policy_count DESC, insurance_route
+            """,
+        )
         by_outlet = _rows(
             connection,
             latest,
@@ -1102,9 +1259,19 @@ def insurance_intelligence(
                    count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insurance_journeys,
                    count(*) FILTER (
                        WHERE has_booking AND has_insurance
-                         AND (insurance_source IS NULL
-                              OR insurance_source NOT IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE'))
-                         AND self_insurance_flag IS NOT TRUE
+                         AND insurance_route='DEALER_ARRANGED'
+                   )::int AS dealer_arranged_journeys,
+                   count(*) FILTER (
+                       WHERE has_booking AND has_insurance
+                         AND insurance_route='CUSTOMER_ARRANGED'
+                   )::int AS customer_arranged_journeys,
+                   count(*) FILTER (
+                       WHERE has_booking AND has_insurance
+                         AND insurance_route='MIXED_OR_UNCLEAR'
+                   )::int AS source_ambiguous_journeys,
+                   count(*) FILTER (
+                       WHERE has_booking AND has_insurance
+                         AND insurance_route='UNSPECIFIED'
                    )::int AS source_unknown_journeys,
                    count(*) FILTER (
                        WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
@@ -1138,17 +1305,60 @@ def insurance_intelligence(
                         AND b.row_data->>'journey_id'=i.row_data->>'journey_id'
                   )
             )
-            SELECT add_on.add_on_name,
-                   count(DISTINCT p.journey_id)::int AS policy_count
-            FROM policies p
-            CROSS JOIN LATERAL jsonb_array_elements_text(
-                CASE
-                    WHEN jsonb_typeof(p.add_ons)='array' THEN p.add_ons
-                    ELSE '[]'::jsonb
-                END
-            ) AS add_on(add_on_name)
-            GROUP BY add_on.add_on_name
-            ORDER BY policy_count DESC, add_on.add_on_name
+            ), add_on_rows AS (
+                SELECT p.journey_id,
+                       trim(add_on.add_on_name) AS raw_name,
+                       regexp_replace(upper(trim(add_on.add_on_name)),
+                                      '[^A-Z0-9]', '', 'g') AS normalized_name
+                FROM policies p
+                CROSS JOIN LATERAL jsonb_array_elements_text(
+                    CASE
+                        WHEN jsonb_typeof(p.add_ons)='array' THEN p.add_ons
+                        ELSE '[]'::jsonb
+                    END
+                ) AS add_on(add_on_name)
+            ), categorized AS (
+                SELECT journey_id,
+                       raw_name,
+                       CASE
+                           WHEN normalized_name LIKE '%DEPRECIATION%'
+                             OR normalized_name LIKE '%NILDEP%'
+                             OR normalized_name LIKE '%ZERODEP%'
+                               THEN 'Zero depreciation'
+                           WHEN normalized_name='RTI'
+                             OR normalized_name LIKE 'RETURNTOINVOICE%'
+                               THEN 'Return to invoice'
+                           WHEN normalized_name LIKE '%CONSUMABLE%'
+                               THEN 'Consumables'
+                           WHEN normalized_name LIKE '%ENGINE%'
+                             OR normalized_name LIKE '%GEARBOX%'
+                               THEN 'Engine / gearbox protection'
+                           WHEN normalized_name IN ('RSA','ROADSIDEASSISTANCE')
+                               THEN 'Roadside assistance'
+                           WHEN normalized_name LIKE '%KEYREPLAC%'
+                               THEN 'Key replacement'
+                           WHEN normalized_name LIKE '%TYRE%'
+                             OR normalized_name LIKE '%TIRE%'
+                               THEN 'Tyre protection'
+                           WHEN normalized_name LIKE '%PERSONALBELONG%'
+                               THEN 'Personal belongings'
+                           WHEN normalized_name LIKE '%IMT23%'
+                               THEN 'IMT-23 extension'
+                           WHEN normalized_name LIKE '%TOWING%'
+                               THEN 'Towing cover'
+                           WHEN normalized_name LIKE '%DRIVER%'
+                               THEN 'Driver liability cover'
+                           ELSE 'Other / unclear cover'
+                       END AS add_on_family
+                FROM add_on_rows
+                WHERE raw_name<>''
+            )
+            SELECT add_on_family AS add_on_name,
+                   count(DISTINCT journey_id)::int AS policy_count,
+                   array_agg(DISTINCT raw_name ORDER BY raw_name) AS raw_terms
+            FROM categorized
+            GROUP BY add_on_family
+            ORDER BY policy_count DESC, add_on_family
             """,
         )
         for row in add_ons:
@@ -1164,12 +1374,15 @@ def insurance_intelligence(
         "summary": summary,
         "by_insurer": by_insurer,
         "by_source": by_source,
+        "by_route": by_route,
         "by_outlet": by_outlet,
         "add_ons": add_ons,
         "definition": (
             "Insurance record rate is captured policy records divided by booked journeys; it is not "
-            "proof that unrecorded journeys were uninsured. Source-coded in-house/self mix is "
-            "reported only when insurance_source or the explicit self-insurance flag is populated."
+            "proof that unrecorded journeys were uninsured. Dealer-arranged and customer-arranged "
+            "routes use explicit insurance_source/self-insurance values first, then exact insurance_by "
+            "labels. Mixed, lender-labelled, and blank routes remain separately identified as unclear "
+            "or unspecified; they are never counted as dealer or customer business."
         ),
     }
 
@@ -1273,6 +1486,192 @@ def vas_intelligence(
             ORDER BY journey_count DESC, d.dealer_name, o.outlet_name, a.addon_type
             """,
         )
+        by_product_type = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT df.dealer_id,
+                   df.dealer_name,
+                   df.outlet_id,
+                   df.outlet_name,
+                   COALESCE(df.model_name,'Unresolved') AS model_name,
+                   COALESCE(df.variant_name,'Unresolved') AS variant_name,
+                   upper(COALESCE(a.row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
+                   count(*)::int AS record_count,
+                   count(DISTINCT df.journey_id)::int AS journey_count,
+                   count(*) FILTER (
+                       WHERE NULLIF(a.row_data->>'actual_amount','') IS NOT NULL
+                   )::int AS priced_records,
+                   COALESCE(sum(NULLIF(a.row_data->>'actual_amount','')::numeric),0)
+                       AS actual_amount,
+                   round(avg(NULLIF(a.row_data->>'actual_amount','')::numeric),2)
+                       AS avg_record_amount
+            FROM deal_facts df
+            JOIN analytics.snapshot_rows a
+              ON a.tenant_id=:tenant_id
+             AND a.dump_id=:dump_id
+             AND a.source_table='journey_addons'
+             AND a.row_data->>'journey_id'=df.journey_id
+            WHERE df.has_booking
+            GROUP BY df.dealer_id, df.dealer_name, df.outlet_id, df.outlet_name,
+                     df.model_name, df.variant_name, addon_type
+            ORDER BY actual_amount DESC, journey_count DESC,
+                     df.dealer_name, df.outlet_name, model_name, variant_name, addon_type
+            """,
+        )
+        accessory_cost_by_product = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            , accessory_lines AS (
+                SELECT df.dealer_id,
+                       df.dealer_name,
+                       df.outlet_id,
+                       df.outlet_name,
+                       COALESCE(df.model_name,'Unresolved') AS model_name,
+                       COALESCE(df.variant_name,'Unresolved') AS variant_name,
+                       NULLIF(a.row_data->>'standard_amount','')::numeric AS standard_amount,
+                       NULLIF(a.row_data->>'actual_amount','')::numeric AS actual_amount
+                FROM deal_facts df
+                JOIN analytics.snapshot_rows a
+                  ON a.tenant_id=:tenant_id
+                 AND a.dump_id=:dump_id
+                 AND a.source_table='commercial_lines'
+                 AND a.row_data->>'journey_id'=df.journey_id
+                 AND a.row_data->>'component_key'='accessories_cost'
+                WHERE df.has_booking
+            )
+            SELECT dealer_id,
+                   dealer_name,
+                   outlet_id,
+                   outlet_name,
+                   model_name,
+                   variant_name,
+                   count(*)::int AS evidence_rows,
+                   count(*) FILTER (WHERE standard_amount IS NOT NULL)::int
+                       AS standard_amount_rows,
+                   count(*) FILTER (WHERE actual_amount IS NOT NULL)::int
+                       AS actual_amount_rows,
+                   count(*) FILTER (
+                       WHERE standard_amount IS NOT NULL AND actual_amount IS NOT NULL
+                   )::int AS comparable_rows,
+                   sum(standard_amount) FILTER (
+                       WHERE standard_amount IS NOT NULL AND actual_amount IS NOT NULL
+                   ) AS comparable_standard_amount,
+                   sum(actual_amount) FILTER (
+                       WHERE standard_amount IS NOT NULL AND actual_amount IS NOT NULL
+                   ) AS comparable_actual_amount,
+                   sum(actual_amount-standard_amount) FILTER (
+                       WHERE standard_amount IS NOT NULL AND actual_amount IS NOT NULL
+                   ) AS comparable_actual_minus_standard
+            FROM accessory_lines
+            GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
+                     model_name, variant_name
+            ORDER BY comparable_actual_minus_standard ASC NULLS FIRST,
+                     comparable_actual_amount DESC NULLS LAST,
+                     dealer_name, outlet_name, model_name, variant_name
+            """,
+        )
+        accessory_line_coverage = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                """
+                SELECT count(*)::int AS total_invoice_lines,
+                       count(*) FILTER (
+                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
+                       )::int AS confirmed_tax_invoice_lines,
+                       count(DISTINCT split_part(source_pk,':',1)) FILTER (
+                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
+                       )::int AS confirmed_tax_invoices,
+                       count(*) FILTER (
+                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='PROFORMA_INVOICE'
+                       )::int AS proforma_lines,
+                       count(*) FILTER (
+                           WHERE upper(COALESCE(row_data->>'invoice_nature','')) NOT IN
+                               ('TAX_INVOICE','PROFORMA_INVOICE')
+                       )::int AS unclassified_lines,
+                       count(*) FILTER (
+                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
+                             AND COALESCE(NULLIF(row_data->>'description',''),
+                                          NULLIF(row_data->>'item_code','')) IS NOT NULL
+                       )::int AS confirmed_lines_with_item_label,
+                       count(*) FILTER (
+                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
+                             AND NULLIF(row_data->>'quantity','') IS NOT NULL
+                       )::int AS confirmed_lines_with_quantity,
+                       count(*) FILTER (
+                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
+                             AND NULLIF(row_data->>'net_amount','') IS NOT NULL
+                       )::int AS confirmed_lines_with_net_amount
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                  AND source_table='derived_accessory_line_items'
+                """,
+            )
+        )
+        accessory_items = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            , confirmed_accessory_lines AS (
+                SELECT a.source_pk,
+                       a.row_data,
+                       df.dealer_id,
+                       df.dealer_name,
+                       df.outlet_id,
+                       df.outlet_name,
+                       COALESCE(NULLIF(df.model_name,''),'Unresolved') AS model_name,
+                       COALESCE(NULLIF(df.variant_name,''),'Unresolved') AS variant_name
+                FROM analytics.snapshot_rows a
+                JOIN deal_facts df
+                  ON df.journey_id=a.row_data->>'journey_id'
+                WHERE a.tenant_id=:tenant_id AND a.dump_id=:dump_id
+                  AND a.source_table='derived_accessory_line_items'
+                  AND upper(COALESCE(a.row_data->>'invoice_nature',''))='TAX_INVOICE'
+                  AND df.has_booking
+            )
+            SELECT dealer_id,
+                   dealer_name,
+                   outlet_id,
+                   outlet_name,
+                   model_name,
+                   variant_name,
+                   COALESCE(NULLIF(row_data->>'line_category',''),'Uncategorized')
+                       AS line_category,
+                   COALESCE(NULLIF(row_data->>'description',''),
+                            NULLIF(row_data->>'item_code',''),'Unlabelled accessory')
+                       AS item_description,
+                   NULLIF(row_data->>'item_code','') AS item_code,
+                   string_agg(DISTINCT NULLIF(row_data->>'source_system',''), ', '
+                       ORDER BY NULLIF(row_data->>'source_system','')) AS invoice_sources,
+                   count(*)::int AS invoice_lines,
+                   count(DISTINCT split_part(source_pk,':',1))::int AS invoice_count,
+                   sum(NULLIF(row_data->>'quantity','')::numeric) AS invoiced_quantity,
+                   count(*) FILTER (
+                       WHERE NULLIF(row_data->>'quantity','') IS NOT NULL
+                   )::int AS lines_with_quantity,
+                   sum(NULLIF(row_data->>'net_amount','')::numeric) AS net_amount,
+                   count(*) FILTER (
+                       WHERE NULLIF(row_data->>'net_amount','') IS NOT NULL
+                   )::int AS lines_with_net_amount,
+                   sum(NULLIF(row_data->>'discount_amount','')::numeric) AS line_discount_amount
+            FROM confirmed_accessory_lines
+            GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
+                     model_name, variant_name, line_category,
+                     item_description, item_code
+            ORDER BY net_amount DESC NULLS LAST, invoice_lines DESC,
+                     dealer_name, outlet_name, model_name, variant_name,
+                     item_description, item_code
+            """,
+        )
         by_model_outlet = _rows(
             connection,
             latest,
@@ -1304,12 +1703,21 @@ def vas_intelligence(
         "journeys": total_journeys,
         "by_type": by_type,
         "by_outlet": by_outlet,
+        "by_product_type": by_product_type,
+        "accessory_cost_by_product": accessory_cost_by_product,
+        "accessory_items": accessory_items,
+        "accessory_line_coverage": accessory_line_coverage,
         "by_model_outlet": by_model_outlet,
         "accessory_codes": ["ACCESSORY", "ACCESSORIES", "ACCESSORIES_TOTAL"],
         "definition": (
-            "Accessory value is the captured ACCESSORY/ACCESSORIES/ACCESSORIES_TOTAL category total. "
-            "This snapshot does not contain individual accessory SKU or quantity detail; model labels "
-            "are displayed as captured and may need catalogue normalization."
+            "Add-on records show the captured VAS category by dealer, outlet, model, and variant. "
+            "Accessory invoice items include only reviewed ACCESSORY-purpose TAX_INVOICE lines and "
+            "are grouped by dealership, outlet, model, variant, category and item code. Proforma and "
+            "unclassified lines are shown only in coverage and are not counted as sold. Missing amount "
+            "or quantity fields remain unavailable. Invoice-line net sales, VAS category totals and "
+            "commercial-line pricing evidence are separate measures and must not be added together. "
+            "The commercial-line comparison uses only rows with both standard and actual amounts. "
+            "Catalogue-matched vehicle labels use the canonical Audit Core model and variant names."
         ),
     }
 

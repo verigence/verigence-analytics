@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import Connection, text
 
+from analytics.config import load_settings
 from analytics.db import analytics_engine
 from analytics.security import Principal, require_analytics_read
 
@@ -12,6 +13,9 @@ router = APIRouter(prefix="/v1/analytics/tenants/{tenant_id}", tags=["analytics"
 
 
 def _latest_dump(connection: Connection, tenant_id: str) -> dict:
+    settings = load_settings(require_security=False)
+    if tenant_id.strip() in settings.excluded_tenant_ids:
+        raise HTTPException(status_code=404, detail="Analytics is disabled for this project")
     row = connection.execute(
         text(
             """
