@@ -219,6 +219,8 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
     if not tenant_id.strip():
         raise ValueError("tenant_id is required")
     settings = load_settings(require_security=False)
+    if tenant_id.strip() in settings.excluded_tenant_ids:
+        raise ValueError("Analytics dump is disabled for an excluded tenant")
     dump_id = uuid4()
     started = datetime.now(UTC)
 
