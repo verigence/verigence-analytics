@@ -1,5 +1,5 @@
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 
 
 # This tenant is intentionally excluded from Analytics API responses and future snapshot imports.
