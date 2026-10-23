@@ -60,6 +60,7 @@ SOURCE_TABLES: tuple[SourceTable, ...] = (
 
 
 _DERIVED_GEOGRAPHY_TABLE = "derived_customer_geography"
+_DERIVED_ACCESSORY_LINE_ITEMS_TABLE = "derived_accessory_line_items"
 
 
 def _identifier(value: str) -> str:
@@ -115,10 +116,30 @@ def _copy_table(
     schema = _identifier(source_schema)
     table_name = _identifier(source_table.name)
     primary_key = _identifier(source_table.primary_key)
-    query = text(
-        f"SELECT CAST(t.{primary_key} AS text) AS source_pk, to_jsonb(t) AS row_data "
-        f"FROM {schema}.{table_name} AS t WHERE t.tenant_id = :tenant_id"
-    )
+    if source_table.name == "journey_products":
+        # Keep the captured evidence labels, but attach the catalogue names when
+        # Audit Core has already resolved this product to a canonical SKU. This
+        # makes Analytics grouping stable without changing the source records.
+        query = text(
+            f"SELECT CAST(t.{primary_key} AS text) AS source_pk, "
+            "to_jsonb(t) || jsonb_strip_nulls(jsonb_build_object("
+            "'canonical_sku_code', s.sku_code, "
+            "'canonical_model_code', m.model_code, "
+            "'canonical_model_name', m.model_name, "
+            "'canonical_variant_code', v.variant_code, "
+            "'canonical_variant_name', v.variant_name"
+            ")) AS row_data "
+            f"FROM {schema}.{table_name} AS t "
+            f"LEFT JOIN {schema}.product_skus AS s ON s.product_sku_id=t.product_sku_id "
+            f"LEFT JOIN {schema}.product_models AS m ON m.model_id=s.model_id "
+            f"LEFT JOIN {schema}.product_variants AS v ON v.variant_id=s.variant_id "
+            "WHERE t.tenant_id = :tenant_id"
+        )
+    else:
+        query = text(
+            f"SELECT CAST(t.{primary_key} AS text) AS source_pk, to_jsonb(t) AS row_data "
+            f"FROM {schema}.{table_name} AS t WHERE t.tenant_id = :tenant_id"
+        )
     result = source.execute(query, {"tenant_id": tenant_id}).mappings()
     table_count = 0
     while True:
@@ -215,6 +236,131 @@ def _copy_derived_customer_geography(
     return row_count
 
 
+def _copy_derived_accessory_line_items(
+    source: Connection,
+    target: Connection,
+    *,
+    source_schema: str,
+    tenant_id: str,
+    dump_id: UUID,
+    batch_size: int,
+) -> int:
+    """Project accessory invoice lines without copying customer or vehicle PII.
+
+    ``invoice_review_values`` includes customer, tax, address and vehicle identifiers.
+    This projection deliberately selects only the journey link, commercial line fields,
+    document classification and redacted invoice source. It never serializes the source
+    row or the complete ``line_items`` JSON.
+    """
+    schema = _identifier(source_schema)
+    query = text(
+        f"""
+        WITH accessory_documents AS (
+            SELECT invoice_review_value_id,
+                   journey_id,
+                   source_system,
+                   document_type_key,
+                   invoice_nature,
+                   line_items
+            FROM {schema}.invoice_review_values
+            WHERE tenant_id = :tenant_id
+              AND upper(trim(COALESCE(invoice_purpose, ''))) = 'ACCESSORY'
+        ), line_rows AS (
+            SELECT d.invoice_review_value_id,
+                   d.journey_id,
+                   d.source_system,
+                   d.document_type_key,
+                   d.invoice_nature,
+                   item.ordinality AS line_number,
+                   item.value AS line_item
+            FROM accessory_documents d
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(d.line_items) = 'array'
+                     THEN d.line_items ELSE '[]'::jsonb END
+            ) WITH ORDINALITY AS item(value, ordinality)
+        ), normalized AS (
+            SELECT *,
+                   left(
+                       regexp_replace(
+                           regexp_replace(
+                               regexp_replace(
+                                   regexp_replace(
+                                       trim(COALESCE(line_item->>'description_raw', '')),
+                                       '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{{2,}}',
+                                       '[redacted email]', 'gi'
+                                   ),
+                                   '(?:\\+?91[ .-]?)?[6-9][0-9]{{4}}[ .-]?[0-9]{{5}}',
+                                   '[redacted phone]', 'gi'
+                               ),
+                               '[A-HJ-NPR-Z0-9]{{17}}', '[redacted vehicle id]', 'gi'
+                           ),
+                           '[0-9]{{2}}[A-Z]{{5}}[0-9]{{4}}[A-Z][A-Z0-9]Z[A-Z0-9]',
+                           '[redacted tax id]', 'gi'
+                       ),
+                       180
+                   ) AS safe_description
+            FROM line_rows
+        )
+        SELECT CAST(invoice_review_value_id AS text) || ':' || line_number AS source_pk,
+               jsonb_strip_nulls(jsonb_build_object(
+                   'journey_id', CAST(journey_id AS text),
+                   'source_system', NULLIF(trim(COALESCE(source_system, '')), ''),
+                   'document_type_key', NULLIF(trim(COALESCE(document_type_key, '')), ''),
+                   'invoice_nature', NULLIF(trim(COALESCE(invoice_nature, '')), ''),
+                   'line_number', line_number,
+                   'line_category', NULLIF(trim(COALESCE(line_item->>'line_category', '')), ''),
+                   'description', NULLIF(safe_description, ''),
+                   'item_code', NULLIF(trim(COALESCE(line_item->>'item_code', '')), ''),
+                   'quantity', CASE
+                       WHEN trim(COALESCE(line_item->>'quantity', '')) ~ '^-?[0-9]+([.][0-9]+)?$'
+                       THEN to_jsonb(trim(line_item->>'quantity')::numeric)
+                   END,
+                   'unit_rate', CASE
+                       WHEN trim(COALESCE(line_item->>'unit_rate', '')) ~ '^-?[0-9]+([.][0-9]+)?$'
+                       THEN to_jsonb(trim(line_item->>'unit_rate')::numeric)
+                   END,
+                   'gross_amount', CASE
+                       WHEN trim(COALESCE(line_item->>'gross_amount', '')) ~ '^-?[0-9]+([.][0-9]+)?$'
+                       THEN to_jsonb(trim(line_item->>'gross_amount')::numeric)
+                   END,
+                   'discount_amount', CASE
+                       WHEN trim(COALESCE(line_item->>'discount_amount', '')) ~ '^-?[0-9]+([.][0-9]+)?$'
+                       THEN to_jsonb(trim(line_item->>'discount_amount')::numeric)
+                   END,
+                   'net_amount', CASE
+                       WHEN trim(COALESCE(line_item->>'net_amount', '')) ~ '^-?[0-9]+([.][0-9]+)?$'
+                       THEN to_jsonb(trim(line_item->>'net_amount')::numeric)
+                   END,
+                   'taxable_amount', CASE
+                       WHEN trim(COALESCE(line_item->>'taxable_amount', '')) ~ '^-?[0-9]+([.][0-9]+)?$'
+                       THEN to_jsonb(trim(line_item->>'taxable_amount')::numeric)
+                   END,
+                   'tax_amount', CASE
+                       WHEN trim(COALESCE(line_item->>'tax_amount', '')) ~ '^-?[0-9]+([.][0-9]+)?$'
+                       THEN to_jsonb(trim(line_item->>'tax_amount')::numeric)
+                   END
+               )) AS row_data
+        FROM normalized
+        """
+    )
+    result = source.execute(query, {"tenant_id": tenant_id}).mappings()
+    row_count = 0
+    while True:
+        batch = result.fetchmany(batch_size)
+        if not batch:
+            break
+        dict_batch = [dict(row) for row in batch]
+        _insert_batch(
+            target,
+            dump_id=dump_id,
+            tenant_id=tenant_id,
+            table=_DERIVED_ACCESSORY_LINE_ITEMS_TABLE,
+            rows=dict_batch,
+        )
+        row_count += len(dict_batch)
+    return row_count
+
+
 def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
     if not tenant_id.strip():
         raise ValueError("tenant_id is required")
@@ -281,6 +427,17 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                     )
                     counts[_DERIVED_GEOGRAPHY_TABLE] = geography_count
                     total += geography_count
+
+                    accessory_line_count = _copy_derived_accessory_line_items(
+                        source,
+                        target,
+                        source_schema=settings.source_schema,
+                        tenant_id=tenant_id,
+                        dump_id=dump_id,
+                        batch_size=settings.dump_batch_size,
+                    )
+                    counts[_DERIVED_ACCESSORY_LINE_ITEMS_TABLE] = accessory_line_count
+                    total += accessory_line_count
                 tx.commit()
             except Exception:
                 tx.rollback()
