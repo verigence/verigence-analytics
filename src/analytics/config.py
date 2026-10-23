@@ -2,6 +2,14 @@ import os
 from dataclasses import dataclass
 
 
+# This tenant is intentionally excluded from Analytics reporting and snapshots.
+_DEFAULT_EXCLUDED_TENANT_IDS = frozenset({"5fbe26ab-6ed7-444a-8488-5bfb81208588"})
+
+
+def _csv_ids(value: str) -> frozenset[str]:
+    return frozenset(part.strip() for part in value.split(",") if part.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     app_env: str
@@ -17,6 +25,7 @@ class Settings:
     source_schema: str
     dump_batch_size: int
     dump_retention: int
+    excluded_tenant_ids: frozenset[str]
 
 
 def _required(name: str) -> str:
@@ -84,4 +93,8 @@ def load_settings(*, require_security: bool = True) -> Settings:
         source_schema=os.environ.get("ANALYTICS_SOURCE_SCHEMA", "auditcore").strip() or "auditcore",
         dump_batch_size=max(50, int(os.environ.get("ANALYTICS_DUMP_BATCH_SIZE", "500"))),
         dump_retention=max(1, int(os.environ.get("ANALYTICS_DUMP_RETENTION", "2"))),
+        excluded_tenant_ids=(
+            _DEFAULT_EXCLUDED_TENANT_IDS
+            | _csv_ids(os.environ.get("ANALYTICS_EXCLUDED_TENANT_IDS", ""))
+        ),
     )
