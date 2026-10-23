@@ -72,8 +72,7 @@ deliveries AS (
 ),
 finance AS (
     SELECT row_data->>'journey_id' AS journey_id,
-           string_agg(DISTINCT NULLIF(row_data->>'provider_name',''), ', ') AS finance_provider,
-           sum(NULLIF(row_data->>'financed_amount','')::numeric) AS financed_amount
+           count(*)::int AS finance_record_count
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='finance_records'
     GROUP BY 1
@@ -83,7 +82,8 @@ insurance AS (
            NULLIF(row_data->>'insurance_by','') AS insurance_by,
            NULLIF(row_data->>'insurer_name','') AS insurer_name,
            NULLIF(row_data->>'actual_premium_amount','')::numeric AS actual_premium_amount,
-           COALESCE(NULLIF(row_data->>'insurance_source',''), 'INHOUSE') AS insurance_source
+           NULLIF(row_data->>'self_insurance_flag','')::boolean AS self_insurance_flag,
+           NULLIF(row_data->>'insurance_source','') AS insurance_source
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
 ),
@@ -161,8 +161,7 @@ payments AS (
     SELECT row_data->>'journey_id' AS journey_id,
            count(*)::int AS payment_count,
            COALESCE(sum(NULLIF(row_data->>'amount','')::numeric),0) AS payment_amount,
-           COALESCE(sum(NULLIF(row_data->>'amount','')::numeric) FILTER (WHERE NULLIF(row_data->>'payment_stage','')='BOOKING'), 0) AS booking_payment_amount,
-           COALESCE(sum(NULLIF(row_data->>'amount','')::numeric) FILTER (WHERE NULLIF(row_data->>'payment_stage','')='DELIVERY'), 0) AS delivery_payment_amount
+           count(*) FILTER (WHERE NULLIF(row_data->>'actual_status_code','') IS NOT NULL)::int AS payment_status_count
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='payments'
     GROUP BY 1
@@ -181,7 +180,8 @@ findings AS (
 ),
 geography AS (
     SELECT row_data->>'journey_id' AS journey_id,
-           NULLIF(row_data->>'customer_pincode','') AS customer_pincode
+           NULLIF(row_data->>'customer_pincode','') AS customer_pincode,
+           NULLIF(row_data->>'source_reviewed_at_utc','') AS source_reviewed_at_utc
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='derived_customer_geography'
 ),
@@ -204,12 +204,18 @@ deal_facts AS (
                 THEN (dl.actual_delivered_at::date - b.booking_date)
                 ELSE NULL END AS tat_days,
            (f.journey_id IS NOT NULL) AS has_finance,
-           f.financed_amount,
            (i.journey_id IS NOT NULL) AS has_insurance,
            i.insurance_by,
            i.insurance_source,
            (i.journey_id IS NOT NULL AND i.insurance_source = 'INHOUSE') AS is_inhouse_insurance,
-           (i.journey_id IS NOT NULL AND i.insurance_source != 'INHOUSE') AS is_outside_insurance,
+           (i.journey_id IS NOT NULL AND (
+               i.insurance_source IN ('SELF','EXTERNAL','OUTSIDE')
+               OR i.self_insurance_flag IS TRUE
+           )) AS is_outside_insurance,
+           (i.journey_id IS NOT NULL
+            AND (i.insurance_source IS NULL OR i.insurance_source NOT IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE'))
+            AND i.self_insurance_flag IS NOT TRUE) AS is_unknown_insurance_source,
+           (i.journey_id IS NOT NULL AND i.actual_premium_amount IS NOT NULL) AS has_insurance_premium,
            COALESCE(i.actual_premium_amount, 0) AS insurance_premium_amount,
            (t.journey_id IS NOT NULL) AS has_trade_in,
            COALESCE(t.trade_in_actual_value, 0) AS trade_in_value,
@@ -231,13 +237,13 @@ deal_facts AS (
            COALESCE(di.dk_other, 0) AS dk_other,
            COALESCE(py.payment_count, 0) AS payment_count,
            COALESCE(py.payment_amount, 0) AS payment_amount,
-           COALESCE(py.booking_payment_amount, 0) AS booking_payment_amount,
-           COALESCE(py.delivery_payment_amount, 0) AS delivery_payment_amount,
+           COALESCE(py.payment_status_count, 0) AS payment_status_count,
            COALESCE(fi.finding_count, 0) AS finding_count,
            COALESCE(fi.open_finding_count, 0) AS open_finding_count,
            COALESCE(fi.high_finding_count, 0) AS high_finding_count,
            COALESCE(fi.missing_document_flag_count, 0) AS missing_document_flag_count,
-           g.customer_pincode
+           g.customer_pincode,
+           g.source_reviewed_at_utc
     FROM journeys j
     LEFT JOIN dealers d ON d.dealer_id=j.dealer_id
     LEFT JOIN outlets o ON o.outlet_id=j.outlet_id
@@ -288,6 +294,8 @@ def project_dashboard(
             count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insured_journeys,
             count(*) FILTER (WHERE has_booking AND is_inhouse_insurance)::int AS inhouse_insurance_journeys,
             count(*) FILTER (WHERE has_booking AND is_outside_insurance)::int AS outside_insurance_journeys,
+            count(*) FILTER (WHERE has_booking AND is_unknown_insurance_source)::int AS insurance_source_unknown_journeys,
+            count(*) FILTER (WHERE has_booking AND has_insurance_premium)::int AS insurance_premium_populated_journeys,
             COALESCE(sum(insurance_premium_amount) FILTER (WHERE has_booking), 0) AS total_insurance_premium,
             count(*) FILTER (WHERE has_booking AND has_accessories)::int AS accessory_journeys,
             COALESCE(sum(accessories_value) FILTER (WHERE has_booking), 0) AS total_accessories_value,
@@ -303,9 +311,17 @@ def project_dashboard(
                  THEN round(100.0 * count(*) FILTER (WHERE has_booking AND has_finance)
                             / count(*) FILTER (WHERE has_booking), 1)
                  ELSE NULL END AS finance_attach_pct,
-            COALESCE(sum(payment_amount), 0) AS total_payment_collected,
-            COALESCE(sum(booking_payment_amount), 0) AS booking_payment_collected,
-            COALESCE(sum(delivery_payment_amount), 0) AS delivery_payment_collected,
+            COALESCE(sum(payment_amount) FILTER (WHERE has_booking), 0) AS recorded_receipt_amount,
+            COALESCE(sum(payment_count) FILTER (WHERE has_booking), 0)::int AS payment_entry_count,
+            count(*) FILTER (WHERE has_booking AND payment_count > 0)::int AS journeys_with_payment_entries,
+            COALESCE(sum(payment_status_count) FILTER (WHERE has_booking), 0)::int AS payment_status_coded_records,
+            CASE WHEN COALESCE(sum(payment_count) FILTER (WHERE has_booking), 0) > 0
+                 THEN round(100.0 * COALESCE(sum(payment_status_count) FILTER (WHERE has_booking), 0)
+                            / sum(payment_count) FILTER (WHERE has_booking), 1)
+                 ELSE NULL END AS payment_status_coverage_pct,
+            count(*) FILTER (WHERE has_booking AND customer_pincode IS NOT NULL)::int AS journeys_with_pincode,
+            count(*) FILTER (WHERE has_booking AND customer_pincode IS NOT NULL
+                                    AND source_reviewed_at_utc IS NOT NULL)::int AS reviewed_pincode_journeys,
             round(avg(tat_days) FILTER (WHERE tat_days IS NOT NULL), 1) AS avg_booking_to_delivery_days,
             percentile_cont(0.5) WITHIN GROUP (ORDER BY tat_days) FILTER (WHERE tat_days IS NOT NULL) AS median_booking_to_delivery_days,
             count(*) FILTER (WHERE finding_count > 0)::int AS journeys_with_findings,
