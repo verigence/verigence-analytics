@@ -83,7 +83,37 @@ insurance AS (
            NULLIF(row_data->>'insurer_name','') AS insurer_name,
            NULLIF(row_data->>'actual_premium_amount','')::numeric AS actual_premium_amount,
            NULLIF(row_data->>'self_insurance_flag','')::boolean AS self_insurance_flag,
-           NULLIF(row_data->>'insurance_source','') AS insurance_source
+           NULLIF(row_data->>'insurance_source','') AS insurance_source,
+           CASE
+               WHEN upper(COALESCE(NULLIF(row_data->>'insurance_source',''),''))='INHOUSE'
+                    AND NULLIF(row_data->>'self_insurance_flag','')::boolean IS TRUE
+                   THEN 'MIXED_OR_UNCLEAR'
+               WHEN upper(COALESCE(NULLIF(row_data->>'insurance_source',''),''))='INHOUSE'
+                   THEN 'DEALER_ARRANGED'
+               WHEN upper(COALESCE(NULLIF(row_data->>'insurance_source',''),''))
+                        IN ('SELF','EXTERNAL','OUTSIDE')
+                    OR NULLIF(row_data->>'self_insurance_flag','')::boolean IS TRUE
+                   THEN 'CUSTOMER_ARRANGED'
+               WHEN regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g')
+                        IN ('DEALER','DLR','DEALERARRANGED','DLRARRANGED')
+                   THEN 'DEALER_ARRANGED'
+               WHEN regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g')
+                        IN ('SELF','OWN','CUSTOMER','DONEBYCUSTOMER',
+                            'CUSTOMERARRANGED','OWNARRANGED')
+                   THEN 'CUSTOMER_ARRANGED'
+               WHEN regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g') LIKE '%OWN%DLR%'
+                 OR regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g') LIKE '%DLR%OWN%'
+                 OR regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g') LIKE '%OWN%DEALER%'
+                 OR regexp_replace(upper(COALESCE(row_data->>'insurance_by','')),
+                                   '[^A-Z0-9]', '', 'g') LIKE '%DEALER%OWN%'
+                   THEN 'MIXED_OR_UNCLEAR'
+               ELSE 'UNSPECIFIED'
+           END AS insurance_route
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
 ),
@@ -207,14 +237,10 @@ deal_facts AS (
            (i.journey_id IS NOT NULL) AS has_insurance,
            i.insurance_by,
            i.insurance_source,
-           (i.journey_id IS NOT NULL AND i.insurance_source = 'INHOUSE') AS is_inhouse_insurance,
-           (i.journey_id IS NOT NULL AND (
-               i.insurance_source IN ('SELF','EXTERNAL','OUTSIDE')
-               OR i.self_insurance_flag IS TRUE
-           )) AS is_outside_insurance,
-           (i.journey_id IS NOT NULL
-            AND (i.insurance_source IS NULL OR i.insurance_source NOT IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE'))
-            AND i.self_insurance_flag IS NOT TRUE) AS is_unknown_insurance_source,
+           (i.journey_id IS NOT NULL AND i.insurance_route = 'DEALER_ARRANGED') AS is_inhouse_insurance,
+           (i.journey_id IS NOT NULL AND i.insurance_route = 'CUSTOMER_ARRANGED') AS is_outside_insurance,
+           (i.journey_id IS NOT NULL AND i.insurance_route = 'UNSPECIFIED') AS is_unknown_insurance_source,
+           (i.journey_id IS NOT NULL AND i.insurance_route = 'MIXED_OR_UNCLEAR') AS is_ambiguous_insurance_source,
            (i.journey_id IS NOT NULL AND i.actual_premium_amount IS NOT NULL) AS has_insurance_premium,
            COALESCE(i.actual_premium_amount, 0) AS insurance_premium_amount,
            (t.journey_id IS NOT NULL) AS has_trade_in,
@@ -294,6 +320,7 @@ def project_dashboard(
             count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insured_journeys,
             count(*) FILTER (WHERE has_booking AND is_inhouse_insurance)::int AS inhouse_insurance_journeys,
             count(*) FILTER (WHERE has_booking AND is_outside_insurance)::int AS outside_insurance_journeys,
+            count(*) FILTER (WHERE has_booking AND is_ambiguous_insurance_source)::int AS insurance_source_ambiguous_journeys,
             count(*) FILTER (WHERE has_booking AND is_unknown_insurance_source)::int AS insurance_source_unknown_journeys,
             count(*) FILTER (WHERE has_booking AND has_insurance_premium)::int AS insurance_premium_populated_journeys,
             COALESCE(sum(insurance_premium_amount) FILTER (WHERE has_booking), 0) AS total_insurance_premium,
