@@ -159,6 +159,40 @@ def _discount_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[di
     }, outlet_rows_by_name
 
 
+def _rollup_outlets_by_dealer(outlet_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate the uncapped outlet exposure rows into an uncapped dealer rollup."""
+    totals: dict[str, dict[str, Any]] = {}
+    count_fields = (
+        "price_exception_journeys",
+        "discount_exception_journeys",
+        "invoice_conflict_journeys",
+        "unknown_discount_applications",
+    )
+    for outlet in outlet_rows:
+        dealer_name = str(outlet.get("dealer_name") or "Unspecified dealer")
+        dealer = totals.setdefault(dealer_name, {
+            "dealer_name": dealer_name,
+            "price_exception_journeys": 0,
+            "discount_exception_journeys": 0,
+            "invoice_conflict_journeys": 0,
+            "known_excess_discount_amount": Decimal(0),
+            "unknown_discount_applications": 0,
+        })
+        for field in count_fields:
+            dealer[field] += int(outlet.get(field) or 0)
+        dealer["known_excess_discount_amount"] += (
+            _decimal(outlet.get("known_excess_discount_amount")) or Decimal(0)
+        )
+
+    rows = list(totals.values())
+    rows.sort(key=lambda row: (
+        -(row["price_exception_journeys"] + row["discount_exception_journeys"]
+          + row["invoice_conflict_journeys"]),
+        -row["known_excess_discount_amount"],
+        row["dealer_name"],
+    ))
+    return rows
+
 def _price_line_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
     standards = 0
     comparable = 0
@@ -373,7 +407,8 @@ def pricing_integrity_report(
             **line_coverage,
         },
         "by_discount_key": discount_summary["by_discount_key"],
-        "by_outlet": outlet_rows[:50],
+        "by_dealer": _rollup_outlets_by_dealer(outlet_rows),
+        "by_outlet": outlet_rows,
         "exceptions": findings[:200],
         "definitions": {
             "exception_status": (
