@@ -408,7 +408,7 @@ def pricing_integrity_report(
         },
         "by_discount_key": discount_summary["by_discount_key"],
         "by_dealer": _rollup_outlets_by_dealer(outlet_rows),
-        "by_outlet": outlet_rows[:50],
+        "by_outlet": outlet_rows,
         "exceptions": findings[:200],
         "definitions": {
             "exception_status": (
