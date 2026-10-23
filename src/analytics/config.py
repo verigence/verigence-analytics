@@ -1,9 +1,7 @@
 import os
-
 from dataclasses import dataclass
 
 
-# This tenant is intentionally excluded from Analytics API responses and future snapshot imports.
 _DEFAULT_EXCLUDED_TENANT_IDS = frozenset({"5fbe26ab-6ed7-444a-8488-5bfb81208588"})
 
 
