@@ -1,6 +1,8 @@
 import os
+from types import SimpleNamespace
 
 import httpx
+from fastapi import HTTPException
 
 os.environ.setdefault("ANALYTICS_DB_URL", "postgresql://unused:unused@localhost/unused")
 os.environ.setdefault("ANALYTICS_SECURITY_JWKS_URL", "https://example.invalid/.well-known/jwks.json")
@@ -8,8 +10,13 @@ os.environ.setdefault("SECURITY_TOKEN_ISSUER", "verigence-security")
 os.environ.setdefault("SECURITY_TOKEN_AUDIENCE", "verigence-platform")
 os.environ.setdefault("ANALYTICS_SECRET_KEY", "test-only-secret")
 
-from analytics.dump import SOURCE_TABLES, _identifier
+from analytics.dump import (
+    SOURCE_TABLES,
+    _copy_derived_accessory_line_items,
+    _identifier,
+)
 from analytics.main import create_app
+from analytics import reports
 from analytics.security_authorization import SecurityAuthorizationClient
 
 
@@ -61,6 +68,49 @@ def test_dump_sources_cover_business_domains() -> None:
         "dealership_staff",
     }
     assert required <= names
+    assert "invoice_review_values" not in names
+
+
+def test_accessory_projection_uses_a_whitelisted_private_safe_query() -> None:
+    class EmptyMappings:
+        def fetchmany(self, _size: int) -> list[dict]:
+            return []
+
+    class EmptyResult:
+        def mappings(self) -> EmptyMappings:
+            return EmptyMappings()
+
+    class RecordingSource:
+        statement = ""
+
+        def execute(self, statement, _params):
+            self.statement = str(statement)
+            return EmptyResult()
+
+    source = RecordingSource()
+    _copy_derived_accessory_line_items(
+        source,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        source_schema="auditcore",
+        tenant_id="tenant",
+        dump_id=__import__("uuid").uuid4(),
+        batch_size=10,
+    )
+
+    sql = source.statement.lower()
+    assert "invoice_review_values" in sql
+    assert "safe_description" in sql
+    assert "[redacted phone]" in sql
+    assert "[redacted email]" in sql
+    assert "to_jsonb(t)" not in sql
+    assert "buyer_name" not in sql
+    assert "buyer_address" not in sql
+    assert "buyer_gstin" not in sql
+    assert "invoice_number" not in sql
+    assert "vin_number" not in sql
+    assert "chassis_number" not in sql
+    assert "engine_number" not in sql
+    assert "vehicle_registration_number" not in sql
 
 
 def test_identifier_guard() -> None:
@@ -71,6 +121,27 @@ def test_identifier_guard() -> None:
         pass
     else:
         raise AssertionError("unsafe SQL identifier accepted")
+
+
+def test_excluded_project_history_is_not_served(monkeypatch) -> None:
+    excluded_tenant_id = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
+    monkeypatch.setattr(
+        reports,
+        "load_settings",
+        lambda **_: SimpleNamespace(excluded_tenant_ids=frozenset({excluded_tenant_id})),
+    )
+
+    class NoDatabaseAccess:
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("excluded project history must not be queried")
+
+    try:
+        reports._latest_dump(NoDatabaseAccess(), excluded_tenant_id)
+    except HTTPException as error:
+        assert error.status_code == 404
+        assert error.detail == "Analytics is disabled for this project"
+    else:
+        raise AssertionError("excluded project history was served")
 
 
 def test_security_authorization_uses_service_identity_and_live_permission_check() -> None:
