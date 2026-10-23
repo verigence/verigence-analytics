@@ -74,12 +74,16 @@ jobs:
           # Normalise: trim spaces, remove empty entries
           CLEANED="$(echo "$RESOLVED" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | tr '\n' ',')"
           CLEANED="${CLEANED%,}"
-          case ",$CLEANED," in
-            *,5fbe26ab-6ed7-444a-8488-5bfb81208588,*)
-              echo "::error::MahindraOrissa is excluded from Analytics DEV scope."
-              exit 1
-              ;;
-          esac
+          IFS=',' read -r -a REQUESTED_TENANTS <<< "$CLEANED"
+          for tenant in "${REQUESTED_TENANTS[@]}"; do
+            case "$tenant" in
+              afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572|4c4bef2a-1d01-498f-98b4-e4f9311282fb) ;;
+              *)
+                echo "::error::Tenant $tenant is not in Analytics DEV scope."
+                exit 1
+                ;;
+            esac
+          done
           echo "tenant_list=$CLEANED" >> "$GITHUB_OUTPUT"
           echo "Tenants to dump: $CLEANED"
 
