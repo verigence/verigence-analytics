@@ -98,27 +98,56 @@ def payments(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_r
     with analytics_engine().connect() as connection:
         latest = _latest_dump(connection, tenant_id)
         rows = _query_rows(connection, """
-            SELECT COALESCE(row_data->>'payment_method_code','UNSPECIFIED') AS payment_method,
-                   COALESCE(NULLIF(row_data->>'payment_stage',''),'UNSPECIFIED') AS payment_stage,
+            WITH payment_rows AS (
+                SELECT upper(COALESCE(NULLIF(row_data->>'payment_mode_code',''),'UNSPECIFIED')) AS mode_code,
+                       upper(COALESCE(NULLIF(row_data->>'payment_method_code',''),'')) AS method_code,
+                       NULLIF(row_data->>'amount','')::numeric AS amount,
+                       NULLIF(row_data->>'actual_status_code','') AS status_code
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='payments'
+            ), normalized AS (
+                SELECT CASE
+                           WHEN method_code ~ '^(UPI|PHONEPE|PHONE[[:space:]]PAY|GPAY|GOOGLE[[:space:]]PAY)([[:space:]/_-]|$)' THEN 'UPI'
+                           WHEN method_code ~ '^RTGS([[:space:]/_-]|$)' THEN 'RTGS'
+                           WHEN method_code ~ '^NEFT([[:space:]/_-]|$)' THEN 'NEFT'
+                           WHEN method_code ~ '^IMPS([[:space:]/_-]|$)' THEN 'IMPS'
+                           WHEN method_code ~ '^CASH([[:space:]/_-]|$)' THEN 'CASH'
+                           WHEN method_code ~ '^(CHEQUE|CHQ)([[:space:]/_-]|$)' THEN 'CHEQUE'
+                           WHEN method_code ~ '^(CARD|DEBIT|CREDIT|VISA|MASTERCARD|RUPAY)([[:space:]/_-]|$)' THEN 'CARD'
+                           WHEN mode_code IN ('RTGS','NEFT','IMPS','CASH','CHEQUE','BANK_TRANSFER') THEN mode_code
+                           ELSE 'OTHER / UNMAPPED'
+                       END AS payment_method,
+                       amount, status_code
+                FROM payment_rows
+            )
+            SELECT payment_method,
                    count(*)::int AS payment_count,
-                   COALESCE(sum(NULLIF(row_data->>'amount','')::numeric),0) AS total_amount
-            FROM analytics.snapshot_rows
-            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='payments'
-            GROUP BY 1,2 ORDER BY total_amount DESC, payment_method, payment_stage
+                   COALESCE(sum(amount),0) AS total_amount,
+                   count(*) FILTER (WHERE status_code IS NOT NULL)::int AS status_coded_count
+            FROM normalized
+            GROUP BY payment_method
+            ORDER BY total_amount DESC, payment_method
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
-        stage_split = _query_rows(connection, """
-            SELECT COALESCE(NULLIF(row_data->>'payment_stage',''),'UNSPECIFIED') AS payment_stage,
-                   count(*)::int AS payment_count,
-                   COALESCE(sum(NULLIF(row_data->>'amount','')::numeric),0) AS total_amount
+        summary = _query_rows(connection, """
+            SELECT count(*)::int AS payment_entry_count,
+                   count(DISTINCT row_data->>'journey_id')::int AS journeys_with_payment_entries,
+                   COALESCE(sum(NULLIF(row_data->>'amount','')::numeric),0) AS recorded_receipt_amount,
+                   count(*) FILTER (WHERE NULLIF(row_data->>'actual_status_code','') IS NOT NULL)::int AS status_coded_entries,
+                   round(100.0 * count(*) FILTER (WHERE NULLIF(row_data->>'actual_status_code','') IS NOT NULL)
+                         / NULLIF(count(*),0),1) AS status_coverage_pct
             FROM analytics.snapshot_rows
             WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='payments'
-            GROUP BY 1 ORDER BY total_amount DESC
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
     return {
         "tenant_id": tenant_id,
         "data_as_of": latest["data_as_of_utc"],
+        "summary": summary[0] if summary else {},
         "rows": rows,
-        "stage_split": stage_split,
+        "definition": (
+            "Amounts are recorded receipt values and are not automatically settled collections. Status coverage is "
+            "reported separately. Payment stages are omitted because the source field is sparsely populated. Raw "
+            "payment references and remarks are not returned."
+        ),
     }
 
 
@@ -126,56 +155,63 @@ def payments(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_r
 def finance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_read)]) -> dict:
     with analytics_engine().connect() as connection:
         latest = _latest_dump(connection, tenant_id)
-        rows = _query_rows(connection, """
-            SELECT COALESCE(f.row_data->>'finance_type_code','UNSPECIFIED') AS finance_type,
-                   COALESCE(f.row_data->>'provider_name','UNSPECIFIED') AS provider,
-                   count(*)::int AS deal_count,
-                   count(DISTINCT f.row_data->>'journey_id')::int AS journey_count,
-                   COALESCE(sum(NULLIF(f.row_data->>'financed_amount','')::numeric),0) AS financed_amount
-            FROM analytics.snapshot_rows f
-            WHERE f.tenant_id=:tenant_id AND f.dump_id=:dump_id AND f.source_table='finance_records'
-              AND EXISTS (
-                  SELECT 1 FROM analytics.snapshot_rows b
-                  WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
-                    AND b.source_table='bookings'
-                    AND b.row_data->>'journey_id'=f.row_data->>'journey_id'
-              )
-            GROUP BY 1,2 ORDER BY deal_count DESC, finance_type, provider
-            """, tenant_id=tenant_id, dump_id=latest["dump_id"])
         summary_rows = _query_rows(connection, """
             WITH booked AS (
                 SELECT DISTINCT row_data->>'journey_id' AS journey_id
                 FROM analytics.snapshot_rows
                 WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
-            ), financed AS (
-                SELECT DISTINCT row_data->>'journey_id' AS journey_id
-                FROM analytics.snapshot_rows
-                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='finance_records'
-            ), finance_totals AS (
-                SELECT count(*)::int AS finance_record_count,
-                       count(DISTINCT f.row_data->>'journey_id')::int AS financed_journeys,
-                       COALESCE(sum(NULLIF(f.row_data->>'financed_amount','')::numeric),0)
-                           AS financed_amount
+            ), finance_rows AS (
+                SELECT f.row_data->>'journey_id' AS journey_id,
+                       upper(COALESCE(NULLIF(f.row_data->>'loan_disbursement_confidence',''),'UNVERIFIED')) AS confidence,
+                       NULLIF(f.row_data->>'loan_disbursement_amount','')::numeric AS loan_amount
                 FROM analytics.snapshot_rows f
                 JOIN booked b ON b.journey_id=f.row_data->>'journey_id'
                 WHERE f.tenant_id=:tenant_id AND f.dump_id=:dump_id
                   AND f.source_table='finance_records'
             )
             SELECT (SELECT count(*)::int FROM booked) AS booked_journeys,
-                   (SELECT count(*)::int FROM booked b JOIN financed f USING (journey_id))
-                       AS financed_bookings,
-                   ft.financed_journeys,
-                   ft.finance_record_count,
-                   ft.financed_amount,
-                   round(100.0 * (SELECT count(*) FROM booked b JOIN financed f USING (journey_id))
-                         / NULLIF((SELECT count(*) FROM booked),0),1) AS finance_attach_pct
-            FROM finance_totals ft
+                   count(DISTINCT journey_id)::int AS financed_journeys,
+                   count(*)::int AS finance_record_count,
+                   count(*) FILTER (WHERE confidence='HIGH' AND loan_amount IS NOT NULL)::int AS high_confidence_loan_records,
+                   COALESCE(sum(loan_amount) FILTER (WHERE confidence='HIGH'),0) AS high_confidence_loan_amount,
+                   count(*) FILTER (WHERE confidence='MEDIUM' AND loan_amount IS NOT NULL)::int AS medium_confidence_loan_records,
+                   COALESCE(sum(loan_amount) FILTER (WHERE confidence='MEDIUM'),0) AS medium_confidence_loan_amount,
+                   count(*) FILTER (WHERE loan_amount IS NULL OR confidence NOT IN ('HIGH','MEDIUM'))::int AS unverified_or_missing_loan_records,
+                   round(100.0 * count(DISTINCT journey_id)
+                         / NULLIF((SELECT count(*) FROM booked),0),1) AS finance_attach_pct,
+                   round(100.0 * count(*) FILTER (WHERE confidence IN ('HIGH','MEDIUM') AND loan_amount IS NOT NULL)
+                         / NULLIF(count(*),0),1) AS loan_amount_capture_pct
+            FROM finance_rows
+            """, tenant_id=tenant_id, dump_id=latest["dump_id"])
+        rows = _query_rows(connection, """
+            SELECT COALESCE(NULLIF(f.row_data->>'finance_type_code',''),'UNSPECIFIED') AS finance_type,
+                   COALESCE(NULLIF(f.row_data->>'provider_name',''),'High-confidence lender not named') AS provider,
+                   'HIGH' AS confidence,
+                   count(*)::int AS deal_count,
+                   count(DISTINCT f.row_data->>'journey_id')::int AS journey_count,
+                   COALESCE(sum(NULLIF(f.row_data->>'loan_disbursement_amount','')::numeric),0) AS loan_amount
+            FROM analytics.snapshot_rows f
+            WHERE f.tenant_id=:tenant_id AND f.dump_id=:dump_id AND f.source_table='finance_records'
+              AND upper(COALESCE(NULLIF(f.row_data->>'loan_disbursement_confidence',''),'UNVERIFIED'))='HIGH'
+              AND NULLIF(f.row_data->>'loan_disbursement_amount','') IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM analytics.snapshot_rows b
+                  WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                    AND b.source_table='bookings'
+                    AND b.row_data->>'journey_id'=f.row_data->>'journey_id'
+              )
+            GROUP BY 1,2 ORDER BY loan_amount DESC, finance_type, provider
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
     return {
         "tenant_id": tenant_id,
         "data_as_of": latest["data_as_of_utc"],
         "summary": summary_rows[0] if summary_rows else {},
         "rows": rows,
+        "definition": (
+            "Finance attach is financed booked journeys divided by booked journeys; it is not an approval rate. "
+            "Lender-attributed amounts use only HIGH-confidence loan disbursement records. MEDIUM-confidence amounts "
+            "are reported separately. The legacy financed_amount field is not used."
+        ),
     }
 
 
@@ -184,21 +220,86 @@ def insurance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_
     with analytics_engine().connect() as connection:
         latest = _latest_dump(connection, tenant_id)
         rows = _query_rows(connection, """
-            SELECT COALESCE(row_data->>'insurance_by','UNSPECIFIED') AS insurance_by,
-                   COALESCE(row_data->>'insurer_name','UNSPECIFIED') AS insurer,
-                   COALESCE(NULLIF(row_data->>'insurance_source',''),'INHOUSE') AS insurance_source,
+            WITH booked AS (
+                SELECT DISTINCT row_data->>'journey_id' AS journey_id
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
+            ), policy_rows AS (
+                SELECT i.row_data->>'journey_id' AS journey_id,
+                       COALESCE(NULLIF(i.row_data->>'insurance_by',''),'Unspecified') AS insurance_by,
+                       COALESCE(NULLIF(i.row_data->>'insurer_name',''),'Unspecified') AS insurer,
+                       upper(NULLIF(i.row_data->>'insurance_source','')) AS source_code,
+                       NULLIF(i.row_data->>'self_insurance_flag','')::boolean AS self_insurance_flag,
+                       NULLIF(i.row_data->>'actual_premium_amount','')::numeric AS premium_amount
+                FROM analytics.snapshot_rows i
+                JOIN booked b ON b.journey_id=i.row_data->>'journey_id'
+                WHERE i.tenant_id=:tenant_id AND i.dump_id=:dump_id
+                  AND i.source_table='insurance_records'
+            )
+            SELECT insurance_by,
+                   insurer,
+                   CASE
+                       WHEN source_code IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE') THEN source_code
+                       WHEN self_insurance_flag IS TRUE THEN 'SELF'
+                       ELSE 'UNKNOWN'
+                   END AS insurance_source,
                    count(*)::int AS policy_count,
-                   COALESCE(sum(NULLIF(row_data->>'actual_premium_amount','')::numeric),0) AS premium_amount
-            FROM analytics.snapshot_rows
-            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
+                   count(*) FILTER (WHERE premium_amount IS NOT NULL)::int AS premium_populated,
+                   COALESCE(sum(premium_amount),0) AS premium_amount
+            FROM policy_rows
             GROUP BY 1,2,3 ORDER BY policy_count DESC, insurance_by, insurer
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
+        summary = _query_rows(connection, """
+            WITH booked AS (
+                SELECT DISTINCT row_data->>'journey_id' AS journey_id
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
+            ), policy_rows AS (
+                SELECT i.row_data->>'journey_id' AS journey_id,
+                       upper(NULLIF(i.row_data->>'insurance_source','')) AS source_code,
+                       NULLIF(i.row_data->>'self_insurance_flag','')::boolean AS self_insurance_flag,
+                       NULLIF(i.row_data->>'actual_premium_amount','')::numeric AS premium_amount
+                FROM analytics.snapshot_rows i
+                JOIN booked b ON b.journey_id=i.row_data->>'journey_id'
+                WHERE i.tenant_id=:tenant_id AND i.dump_id=:dump_id
+                  AND i.source_table='insurance_records'
+            )
+            SELECT (SELECT count(*)::int FROM booked) AS booked_journeys,
+                   count(DISTINCT journey_id)::int AS insurance_journeys,
+                   count(*)::int AS policy_records,
+                   count(*) FILTER (WHERE premium_amount IS NOT NULL)::int AS premium_populated,
+                   COALESCE(sum(premium_amount),0) AS captured_premium,
+                   count(DISTINCT journey_id) FILTER (
+                       WHERE (source_code IS NULL OR source_code NOT IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE'))
+                         AND self_insurance_flag IS NOT TRUE
+                   )::int AS source_unclassified_journeys,
+                   round(100.0 * count(DISTINCT journey_id)
+                         / NULLIF((SELECT count(*) FROM booked),0),1) AS insurance_record_rate_pct
+            FROM policy_rows
+            """, tenant_id=tenant_id, dump_id=latest["dump_id"])
         source_split = _query_rows(connection, """
-            SELECT COALESCE(NULLIF(row_data->>'insurance_source',''),'INHOUSE') AS insurance_source,
+            WITH booked AS (
+                SELECT DISTINCT row_data->>'journey_id' AS journey_id
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
+            ), policy_rows AS (
+                SELECT i.row_data->>'journey_id' AS journey_id,
+                       upper(NULLIF(i.row_data->>'insurance_source','')) AS source_code,
+                       NULLIF(i.row_data->>'self_insurance_flag','')::boolean AS self_insurance_flag,
+                       NULLIF(i.row_data->>'actual_premium_amount','')::numeric AS premium_amount
+                FROM analytics.snapshot_rows i
+                JOIN booked b ON b.journey_id=i.row_data->>'journey_id'
+                WHERE i.tenant_id=:tenant_id AND i.dump_id=:dump_id
+                  AND i.source_table='insurance_records'
+            )
+            SELECT CASE
+                       WHEN source_code IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE') THEN source_code
+                       WHEN self_insurance_flag IS TRUE THEN 'SELF'
+                       ELSE 'UNKNOWN'
+                   END AS insurance_source,
                    count(*)::int AS policy_count,
-                   COALESCE(sum(NULLIF(row_data->>'actual_premium_amount','')::numeric),0) AS premium_amount
-            FROM analytics.snapshot_rows
-            WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='insurance_records'
+                   COALESCE(sum(premium_amount),0) AS premium_amount
+            FROM policy_rows
             GROUP BY 1 ORDER BY policy_count DESC
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
         duplicate_agent_codes = _query_rows(connection, """
@@ -211,9 +312,15 @@ def insurance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_
     return {
         "tenant_id": tenant_id,
         "data_as_of": latest["data_as_of_utc"],
+        "summary": summary[0] if summary else {},
         "rows": rows,
         "source_split": source_split,
         "duplicate_agent_codes": duplicate_agent_codes,
+        "definition": (
+            "Insurance record rate uses distinct booked journeys with a policy record divided by booked journeys. "
+            "An absent record is not proof a vehicle was uninsured. Unknown source values remain UNKNOWN; they are not "
+            "defaulted to in-house. Premium is captured policy value, not automatically dealership revenue."
+        ),
     }
 
 
