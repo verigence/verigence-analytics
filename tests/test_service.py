@@ -31,6 +31,8 @@ def test_health_route_is_registered() -> None:
     assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/vas" in paths
     assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/compliance" in paths
     assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/geography" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/finance" in paths
+    assert "/v1/analytics/tenants/{tenant_id}/business-intelligence/payments" in paths
 
 
 def test_dump_sources_cover_business_domains() -> None:
