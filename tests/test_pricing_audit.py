@@ -5,6 +5,7 @@ from analytics.pricing_audit import (
     _discount_audit,
     _discount_entitlement,
     _price_line_coverage,
+    _rollup_outlets_by_dealer,
 )
 
 
@@ -43,6 +44,50 @@ def test_discount_excess_is_compared_per_application_without_cross_key_netting()
     assert summary["known_excess_discount_journeys"] == 1
     assert summary["known_excess_application_count"] == 1
     assert outlets[("Dealer A", "Outlet 1")]["known_excess_discount_amount"] == Decimal(200)
+
+
+def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None:
+    rows = [
+        {
+            "dealer_name": "Dealer A",
+            "outlet_name": "Outlet 1",
+            "price_exception_journeys": 2,
+            "discount_exception_journeys": 3,
+            "invoice_conflict_journeys": 1,
+            "known_excess_discount_amount": Decimal("1250"),
+            "unknown_discount_applications": 2,
+        },
+        {
+            "dealer_name": "Dealer A",
+            "outlet_name": "Outlet 2",
+            "price_exception_journeys": 1,
+            "discount_exception_journeys": 2,
+            "invoice_conflict_journeys": 0,
+            "known_excess_discount_amount": Decimal("750"),
+            "unknown_discount_applications": 4,
+        },
+        {
+            "dealer_name": "Dealer B",
+            "outlet_name": "Outlet 3",
+            "price_exception_journeys": 0,
+            "discount_exception_journeys": 0,
+            "invoice_conflict_journeys": 1,
+            "known_excess_discount_amount": Decimal("0"),
+            "unknown_discount_applications": 0,
+        },
+    ]
+
+    dealers = _rollup_outlets_by_dealer(rows)
+
+    assert dealers[0] == {
+        "dealer_name": "Dealer A",
+        "price_exception_journeys": 3,
+        "discount_exception_journeys": 5,
+        "invoice_conflict_journeys": 1,
+        "known_excess_discount_amount": Decimal("2000"),
+        "unknown_discount_applications": 6,
+    }
+    assert dealers[1]["dealer_name"] == "Dealer B"
 
 
 def test_discount_tolerance_and_unknown_entitlements_are_kept_separate() -> None:
