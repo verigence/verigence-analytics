@@ -1582,36 +1582,50 @@ def vas_intelligence(
                 latest,
                 tenant_id,
                 """
-                SELECT count(*)::int AS total_invoice_lines,
-                       count(*) FILTER (
-                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
-                       )::int AS confirmed_tax_invoice_lines,
-                       count(DISTINCT split_part(source_pk,':',1)) FILTER (
-                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
-                       )::int AS confirmed_tax_invoices,
-                       count(*) FILTER (
-                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='PROFORMA_INVOICE'
-                       )::int AS proforma_lines,
-                       count(*) FILTER (
-                           WHERE upper(COALESCE(row_data->>'invoice_nature','')) NOT IN
-                               ('TAX_INVOICE','PROFORMA_INVOICE')
-                       )::int AS unclassified_lines,
-                       count(*) FILTER (
-                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
-                             AND COALESCE(NULLIF(row_data->>'description',''),
-                                          NULLIF(row_data->>'item_code','')) IS NOT NULL
-                       )::int AS confirmed_lines_with_item_label,
-                       count(*) FILTER (
-                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
-                             AND NULLIF(row_data->>'quantity','') IS NOT NULL
-                       )::int AS confirmed_lines_with_quantity,
-                       count(*) FILTER (
-                           WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
-                             AND NULLIF(row_data->>'net_amount','') IS NOT NULL
-                       )::int AS confirmed_lines_with_net_amount
-                FROM analytics.snapshot_rows
-                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
-                  AND source_table='derived_accessory_line_items'
+                WITH line_rows AS (
+                    SELECT source_pk, row_data
+                    FROM analytics.snapshot_rows
+                    WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                      AND source_table='derived_accessory_line_items'
+                ), invoice_documents AS (
+                    SELECT split_part(source_pk,':',1) AS document_key,
+                           max(upper(COALESCE(row_data->>'invoice_nature','')))
+                               AS invoice_nature,
+                           max(NULLIF(row_data->>'source_document_count','')::int)
+                               AS source_document_count
+                    FROM line_rows
+                    GROUP BY split_part(source_pk,':',1)
+                )
+                SELECT (SELECT count(*)::int FROM line_rows) AS total_invoice_lines,
+                       (SELECT count(*)::int FROM line_rows
+                        WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE')
+                           AS confirmed_tax_invoice_lines,
+                       (SELECT count(*)::int FROM invoice_documents
+                        WHERE invoice_nature='TAX_INVOICE') AS confirmed_tax_invoices,
+                       (SELECT count(*)::int FROM line_rows
+                        WHERE upper(COALESCE(row_data->>'invoice_nature',''))='PROFORMA_INVOICE')
+                           AS proforma_lines,
+                       (SELECT count(*)::int FROM line_rows
+                        WHERE upper(COALESCE(row_data->>'invoice_nature','')) NOT IN
+                            ('TAX_INVOICE','PROFORMA_INVOICE')) AS unclassified_lines,
+                       (SELECT count(*)::int FROM line_rows
+                        WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
+                          AND COALESCE(NULLIF(row_data->>'description',''),
+                                       NULLIF(row_data->>'item_code','')) IS NOT NULL)
+                           AS confirmed_lines_with_item_label,
+                       (SELECT count(*)::int FROM line_rows
+                        WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
+                          AND NULLIF(row_data->>'quantity','') IS NOT NULL)
+                           AS confirmed_lines_with_quantity,
+                       (SELECT count(*)::int FROM line_rows
+                        WHERE upper(COALESCE(row_data->>'invoice_nature',''))='TAX_INVOICE'
+                          AND NULLIF(row_data->>'net_amount','') IS NOT NULL)
+                           AS confirmed_lines_with_net_amount,
+                       (SELECT count(*)::int FROM invoice_documents
+                        WHERE source_document_count > 1) AS duplicate_invoice_groups,
+                       (SELECT COALESCE(sum(source_document_count-1),0)::int
+                        FROM invoice_documents WHERE source_document_count > 1)
+                           AS duplicate_source_documents
                 """,
             )
         )
@@ -1714,7 +1728,9 @@ def vas_intelligence(
             "Accessory invoice items include only reviewed ACCESSORY-purpose TAX_INVOICE lines and "
             "are grouped by dealership, outlet, model, variant, category and item code. Proforma and "
             "unclassified lines are shown only in coverage and are not counted as sold. Missing amount "
-            "or quantity fields remain unavailable. Invoice-line net sales, VAS category totals and "
+            "or quantity fields remain unavailable. Repeated invoice identities on the same journey "
+            "are counted once, using the most complete and recently reviewed source copy. Invoice-line "
+            "net sales, VAS category totals and "
             "commercial-line pricing evidence are separate measures and must not be added together. "
             "The commercial-line comparison uses only rows with both standard and actual amounts. "
             "Catalogue-matched vehicle labels use the canonical Audit Core model and variant names."

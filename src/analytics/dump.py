@@ -261,23 +261,86 @@ def _copy_derived_accessory_line_items(
                    source_system,
                    document_type_key,
                    invoice_nature,
+                   invoice_number,
+                   invoice_date,
+                   grand_total_amount,
+                   taxable_amount,
+                   invoice_discount_amount,
+                   reviewed_at_utc,
+                   updated_at_utc,
                    line_items
             FROM {schema}.invoice_review_values
             WHERE tenant_id = :tenant_id
               AND upper(trim(COALESCE(invoice_purpose, ''))) = 'ACCESSORY'
+        ), ranked_documents AS (
+            SELECT d.invoice_review_value_id,
+                   d.journey_id,
+                   d.source_system,
+                   d.document_type_key,
+                   d.invoice_nature,
+                   d.line_items,
+                   count(*) OVER (
+                       PARTITION BY d.journey_id,
+                           COALESCE(
+                               NULLIF(upper(trim(d.invoice_number)), ''),
+                               'SOURCE:' || CAST(d.invoice_review_value_id AS text)
+                           ),
+                           d.invoice_date,
+                           d.grand_total_amount,
+                           d.taxable_amount,
+                           d.invoice_discount_amount
+                   ) AS source_document_count,
+                   row_number() OVER (
+                       PARTITION BY d.journey_id,
+                           COALESCE(
+                               NULLIF(upper(trim(d.invoice_number)), ''),
+                               'SOURCE:' || CAST(d.invoice_review_value_id AS text)
+                           ),
+                           d.invoice_date,
+                           d.grand_total_amount,
+                           d.taxable_amount,
+                           d.invoice_discount_amount
+                       ORDER BY (
+                           SELECT COALESCE(sum(
+                               (CASE WHEN NULLIF(trim(item.value->>'description_raw'), '')
+                                           IS NOT NULL THEN 1 ELSE 0 END) +
+                               (CASE WHEN NULLIF(trim(item.value->>'item_code'), '')
+                                           IS NOT NULL THEN 1 ELSE 0 END) +
+                               (CASE WHEN NULLIF(trim(item.value->>'quantity'), '')
+                                           IS NOT NULL THEN 1 ELSE 0 END) +
+                               (CASE WHEN NULLIF(trim(item.value->>'net_amount'), '')
+                                           IS NOT NULL THEN 1 ELSE 0 END)
+                           ),0)
+                           FROM jsonb_array_elements(
+                               CASE WHEN jsonb_typeof(d.line_items) = 'array'
+                                    THEN d.line_items ELSE '[]'::jsonb END
+                           ) AS item(value)
+                       ) DESC,
+                       d.updated_at_utc DESC NULLS LAST,
+                       d.reviewed_at_utc DESC NULLS LAST,
+                       CASE upper(COALESCE(d.source_system, ''))
+                           WHEN 'DMS' THEN 1
+                           WHEN 'TALLY' THEN 2
+                           ELSE 3
+                       END,
+                       d.invoice_review_value_id
+                   ) AS source_rank
+            FROM accessory_documents d
         ), line_rows AS (
             SELECT d.invoice_review_value_id,
                    d.journey_id,
                    d.source_system,
                    d.document_type_key,
                    d.invoice_nature,
+                   d.source_document_count,
                    item.ordinality AS line_number,
                    item.value AS line_item
-            FROM accessory_documents d
+            FROM ranked_documents d
             CROSS JOIN LATERAL jsonb_array_elements(
                 CASE WHEN jsonb_typeof(d.line_items) = 'array'
                      THEN d.line_items ELSE '[]'::jsonb END
             ) WITH ORDINALITY AS item(value, ordinality)
+            WHERE d.source_rank = 1
         ), normalized AS (
             SELECT *,
                    left(
@@ -307,6 +370,7 @@ def _copy_derived_accessory_line_items(
                    'source_system', NULLIF(trim(COALESCE(source_system, '')), ''),
                    'document_type_key', NULLIF(trim(COALESCE(document_type_key, '')), ''),
                    'invoice_nature', NULLIF(trim(COALESCE(invoice_nature, '')), ''),
+                   'source_document_count', source_document_count,
                    'line_number', line_number,
                    'line_category', NULLIF(trim(COALESCE(line_item->>'line_category', '')), ''),
                    'description', NULLIF(safe_description, ''),

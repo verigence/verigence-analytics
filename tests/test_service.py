@@ -1,5 +1,6 @@
 import os
 from types import SimpleNamespace
+from uuid import uuid4
 
 import httpx
 from fastapi import HTTPException
@@ -93,20 +94,24 @@ def test_accessory_projection_uses_a_whitelisted_private_safe_query() -> None:
         None,  # type: ignore[arg-type]
         source_schema="auditcore",
         tenant_id="tenant",
-        dump_id=__import__("uuid").uuid4(),
+        dump_id=uuid4(),
         batch_size=10,
     )
 
     sql = source.statement.lower()
     assert "invoice_review_values" in sql
     assert "safe_description" in sql
+    assert "source_document_count" in sql
+    assert "row_number() over" in sql
+    assert "updated_at_utc desc nulls last" in sql
     assert "[redacted phone]" in sql
     assert "[redacted email]" in sql
     assert "to_jsonb(t)" not in sql
+    payload = sql.split("jsonb_build_object(", 1)[1].split(")) as row_data", 1)[0]
     assert "buyer_name" not in sql
     assert "buyer_address" not in sql
     assert "buyer_gstin" not in sql
-    assert "invoice_number" not in sql
+    assert "'invoice_number'" not in payload
     assert "vin_number" not in sql
     assert "chassis_number" not in sql
     assert "engine_number" not in sql
