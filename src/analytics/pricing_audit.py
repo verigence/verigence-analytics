@@ -76,6 +76,9 @@ def _discount_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[di
     total_known_excess = Decimal(0)
     excess_applications = 0
     excess_journeys: set[str] = set()
+    total_strict_excess = Decimal(0)
+    strict_excess_applications = 0
+    strict_excess_journeys: set[str] = set()
     unknown_entitlement_applications = 0
     missing_evidence_applications = 0
 
@@ -86,10 +89,12 @@ def _discount_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[di
 
         key = str(row.get("discount_key") or "UNSPECIFIED")
         entitlement = _discount_entitlement(row)
-        extra = max(actual - entitlement, Decimal(0)) if entitlement is not None else None
+        strict_extra = max(actual - entitlement, Decimal(0)) if entitlement is not None else None
+        extra = strict_extra
         if extra is not None and extra <= _LINE_TOLERANCE:
             extra = Decimal(0)
         is_exception = extra is not None and extra > 0
+        has_strict_excess = strict_extra is not None and strict_extra > 0
         if entitlement is None:
             unknown_entitlement_applications += 1
         if str(row.get("evidence_status") or "").upper() == "MISSING":
@@ -99,6 +104,9 @@ def _discount_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[di
             "discount_key": key,
             "application_count": 0,
             "journey_ids": set(),
+            "strict_journey_ids": set(),
+            "strict_excess_discount_amount": Decimal(0),
+            "strict_excess_application_count": 0,
             "known_excess_discount_amount": Decimal(0),
             "excess_application_count": 0,
             "unknown_entitlement_count": 0,
@@ -106,6 +114,14 @@ def _discount_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[di
         })
         key_row["application_count"] += 1
         key_row["journey_ids"].add(row["journey_id"])
+        if strict_extra is not None:
+            key_row["strict_excess_discount_amount"] += strict_extra
+            total_strict_excess += strict_extra
+        if has_strict_excess:
+            key_row["strict_excess_application_count"] += 1
+            key_row["strict_journey_ids"].add(row["journey_id"])
+            strict_excess_applications += 1
+            strict_excess_journeys.add(row["journey_id"])
         if extra is not None:
             key_row["known_excess_discount_amount"] += extra
             total_known_excess += extra
@@ -123,11 +139,19 @@ def _discount_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[di
         outlet_row = by_outlet.setdefault(outlet_key, {
             "dealer_name": outlet_key[0],
             "outlet_name": outlet_key[1],
+            "strict_excess_discount_amount": Decimal(0),
+            "strict_excess_applications": 0,
+            "strict_discount_journey_ids": set(),
             "known_excess_discount_amount": Decimal(0),
             "unknown_discount_applications": 0,
             "discount_journey_ids": set(),
         })
         outlet_row["discount_journey_ids"].add(row["journey_id"])
+        if strict_extra is not None:
+            outlet_row["strict_excess_discount_amount"] += strict_extra
+        if has_strict_excess:
+            outlet_row["strict_excess_applications"] += 1
+            outlet_row["strict_discount_journey_ids"].add(row["journey_id"])
         if extra is not None:
             outlet_row["known_excess_discount_amount"] += extra
         if entitlement is None:
@@ -136,20 +160,35 @@ def _discount_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[di
     key_rows = []
     for row in by_key.values():
         key_rows.append({
-            **{key: value for key, value in row.items() if key != "journey_ids"},
+            **{
+                key: value for key, value in row.items()
+                if key not in ("journey_ids", "strict_journey_ids")
+            },
             "journey_count": len(row["journey_ids"]),
+            "strict_excess_journey_count": len(row["strict_journey_ids"]),
         })
-    key_rows.sort(key=lambda row: (-row["known_excess_discount_amount"], row["discount_key"]))
+    key_rows.sort(key=lambda row: (
+        -row["strict_excess_discount_amount"],
+        -row["known_excess_discount_amount"],
+        row["discount_key"],
+    ))
 
     outlet_rows = []
     for row in by_outlet.values():
         outlet_rows.append({
-            **{key: value for key, value in row.items() if key != "discount_journey_ids"},
+            **{
+                key: value for key, value in row.items()
+                if key not in ("discount_journey_ids", "strict_discount_journey_ids")
+            },
             "discount_journeys": len(row["discount_journey_ids"]),
+            "strict_excess_journeys": len(row["strict_discount_journey_ids"]),
         })
     outlet_rows_by_name = {(row["dealer_name"], row["outlet_name"]): row for row in outlet_rows}
 
     return {
+        "strict_excess_discount_amount": total_strict_excess,
+        "strict_excess_application_count": strict_excess_applications,
+        "strict_excess_discount_journeys": len(strict_excess_journeys),
         "known_excess_discount_amount": total_known_excess,
         "known_excess_application_count": excess_applications,
         "known_excess_discount_journeys": len(excess_journeys),
@@ -166,6 +205,7 @@ def _rollup_outlets_by_dealer(outlet_rows: list[dict[str, Any]]) -> list[dict[st
         "price_exception_journeys",
         "discount_exception_journeys",
         "invoice_conflict_journeys",
+        "strict_excess_applications",
         "unknown_discount_applications",
     )
     for outlet in outlet_rows:
@@ -175,6 +215,9 @@ def _rollup_outlets_by_dealer(outlet_rows: list[dict[str, Any]]) -> list[dict[st
             "price_exception_journeys": 0,
             "discount_exception_journeys": 0,
             "invoice_conflict_journeys": 0,
+            "strict_excess_applications": 0,
+            "strict_excess_discount_amount": Decimal(0),
+            "strict_excess_journeys": 0,
             "known_excess_discount_amount": Decimal(0),
             "unknown_discount_applications": 0,
         })
@@ -183,11 +226,16 @@ def _rollup_outlets_by_dealer(outlet_rows: list[dict[str, Any]]) -> list[dict[st
         dealer["known_excess_discount_amount"] += (
             _decimal(outlet.get("known_excess_discount_amount")) or Decimal(0)
         )
+        dealer["strict_excess_discount_amount"] += (
+            _decimal(outlet.get("strict_excess_discount_amount")) or Decimal(0)
+        )
+        dealer["strict_excess_journeys"] += int(outlet.get("strict_excess_journeys") or 0)
 
     rows = list(totals.values())
     rows.sort(key=lambda row: (
         -(row["price_exception_journeys"] + row["discount_exception_journeys"]
           + row["invoice_conflict_journeys"]),
+        -row["strict_excess_discount_amount"],
         -row["known_excess_discount_amount"],
         row["dealer_name"],
     ))
@@ -380,12 +428,18 @@ def pricing_integrity_report(
             "price_exception_journeys": len(audit_counts.get("price_journey_ids", set())),
             "discount_exception_journeys": len(audit_counts.get("discount_journey_ids", set())),
             "invoice_conflict_journeys": len(audit_counts.get("invoice_conflict_journey_ids", set())),
+            "strict_excess_discount_amount": discount_data.get(
+                "strict_excess_discount_amount", Decimal(0)
+            ),
+            "strict_excess_applications": discount_data.get("strict_excess_applications", 0),
+            "strict_excess_journeys": discount_data.get("strict_excess_journeys", 0),
             "known_excess_discount_amount": discount_data.get("known_excess_discount_amount", Decimal(0)),
             "unknown_discount_applications": discount_data.get("unknown_discount_applications", 0),
         })
     outlet_rows.sort(key=lambda row: (
         -(row["price_exception_journeys"] + row["discount_exception_journeys"]
           + row["invoice_conflict_journeys"]),
+        -row["strict_excess_discount_amount"],
         -row["known_excess_discount_amount"], row["dealer_name"], row["outlet_name"],
     ))
 
@@ -419,9 +473,10 @@ def pricing_integrity_report(
             "known_excess_discount": (
                 "Per application, actual discount less its captured entitlement, floored at zero. "
                 "Applications without a known entitlement, including unattributed management-referral "
-                "amounts, are excluded and counted as unknown. Overages summarize the latest captured "
-                "applications; unresolved status is shown separately from current Audit Core findings. "
-                "A line exception uses Audit Core's ₹100 tolerance."
+                "amounts, are excluded and counted as unknown. strict_excess_discount_amount reports "
+                "every positive known overage before tolerance. known_excess_discount_amount reports "
+                "only overages above Audit Core's ₹100 tolerance. Both summarize captured applications; "
+                "unresolved status is shown separately from current Audit Core findings."
             ),
             "price_line_coverage": (
                 "Commercial component rows with both a standard and current actual divided by rows with a "

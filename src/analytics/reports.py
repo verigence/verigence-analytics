@@ -422,7 +422,7 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
         # Per-employee summary: journeys created, bookings, deliveries, time taken
         summary = _query_rows(connection, """
             WITH jny AS (
-                SELECT
+                SELECT DISTINCT ON (row_data->>'journey_id')
                     COALESCE(NULLIF(row_data->>'created_by_actor_id',''), NULLIF(row_data->>'created_by_display_name',''), 'Unknown') AS employee_key,
                     COALESCE(NULLIF(row_data->>'created_by_display_name',''), NULLIF(row_data->>'created_by_actor_id',''), 'Unknown') AS employee_name,
                     NULLIF(row_data->>'created_by_actor_id','') AS actor_id,
@@ -430,20 +430,24 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
                     NULLIF(row_data->>'created_at_utc','')::timestamptz AS journey_created_at
                 FROM analytics.snapshot_rows
                 WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journeys'
+                ORDER BY row_data->>'journey_id',
+                         NULLIF(row_data->>'created_at_utc','')::timestamptz ASC NULLS LAST
             ),
             bkg AS (
                 SELECT row_data->>'journey_id' AS journey_id,
-                       (NULLIF(row_data->>'booking_date','') IS NOT NULL) AS has_booking_date
+                       bool_or(NULLIF(row_data->>'booking_date','') IS NOT NULL) AS has_booking_date
                 FROM analytics.snapshot_rows
                 WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
+                GROUP BY 1
             ),
             dlv AS (
                 SELECT row_data->>'journey_id' AS journey_id,
-                       NULLIF(row_data->>'actual_delivered_at','')::timestamptz AS actual_delivered_at,
-                       NULLIF(row_data->>'actual_delivery_status_code','') AS delivery_status,
-                       NULLIF(row_data->>'created_at_utc','')::timestamptz AS delivery_created_at
+                       max(NULLIF(row_data->>'actual_delivered_at','')::timestamptz) AS actual_delivered_at,
+                       bool_or(NULLIF(row_data->>'actual_delivery_status_code','') IS NOT NULL) AS delivery_started,
+                       max(NULLIF(row_data->>'created_at_utc','')::timestamptz) AS delivery_created_at
                 FROM analytics.snapshot_rows
                 WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='deliveries'
+                GROUP BY 1
             )
             SELECT
                 COALESCE(NULLIF(max(j.employee_name),''), 'Unknown') AS employee_name,
@@ -451,20 +455,38 @@ def productivity(tenant_id: str, _: Annotated[Principal, Depends(require_analyti
                 count(DISTINCT j.journey_id)::int                               AS journeys_created,
                 count(DISTINCT b.journey_id)::int                               AS bookings,
                 count(DISTINCT b.journey_id) FILTER (WHERE b.has_booking_date)::int AS bookings_with_date,
-                count(DISTINCT d.journey_id) FILTER (WHERE d.delivery_status IS NOT NULL)::int AS deliveries_started,
-                count(DISTINCT d.journey_id) FILTER (WHERE d.actual_delivered_at IS NOT NULL)::int AS deliveries_completed,
+                count(DISTINCT d.journey_id) FILTER (
+                    WHERE b.journey_id IS NOT NULL
+                      AND (d.delivery_created_at IS NOT NULL OR d.delivery_started)
+                )::int AS deliveries_started,
+                count(DISTINCT d.journey_id) FILTER (
+                    WHERE b.journey_id IS NOT NULL AND d.actual_delivered_at IS NOT NULL
+                )::int AS deliveries_completed,
+                round(100.0 * count(DISTINCT b.journey_id)
+                      / NULLIF(count(DISTINCT j.journey_id),0),1)::float AS booking_rate_pct,
+                round(100.0 * count(DISTINCT d.journey_id) FILTER (
+                          WHERE b.journey_id IS NOT NULL AND d.actual_delivered_at IS NOT NULL
+                      ) / NULLIF(count(DISTINCT b.journey_id),0),1)::float AS delivery_completion_pct,
                 round(avg(
                     EXTRACT(EPOCH FROM (
-                        COALESCE(d.actual_delivered_at, d.delivery_created_at) - j.journey_created_at
+                        d.delivery_created_at - j.journey_created_at
                     )) / 86400.0
                 ) FILTER (
-                    WHERE COALESCE(d.actual_delivered_at, d.delivery_created_at) IS NOT NULL
-                ), 1)::float AS avg_days_journey_to_delivery,
+                    WHERE j.journey_created_at IS NOT NULL
+                      AND b.journey_id IS NOT NULL
+                      AND d.delivery_created_at IS NOT NULL
+                      AND d.delivery_created_at >= j.journey_created_at
+                ), 1)::float AS avg_days_to_delivery_start,
                 round(avg(
-                    EXTRACT(EPOCH FROM (d.actual_delivered_at - j.journey_created_at)) / 86400.0
+                    EXTRACT(EPOCH FROM (
+                        d.actual_delivered_at - j.journey_created_at
+                    )) / 86400.0
                 ) FILTER (
-                    WHERE d.actual_delivered_at IS NOT NULL
-                ), 1)::float AS avg_days_to_completion
+                    WHERE j.journey_created_at IS NOT NULL
+                      AND b.journey_id IS NOT NULL
+                      AND d.actual_delivered_at IS NOT NULL
+                      AND d.actual_delivered_at >= j.journey_created_at
+                ), 1)::float AS avg_days_journey_to_delivery
             FROM jny j
             LEFT JOIN bkg b ON b.journey_id = j.journey_id
             LEFT JOIN dlv d ON d.journey_id = j.journey_id

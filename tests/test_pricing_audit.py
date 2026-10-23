@@ -43,7 +43,12 @@ def test_discount_excess_is_compared_per_application_without_cross_key_netting()
     assert summary["known_excess_discount_amount"] == Decimal(200)
     assert summary["known_excess_discount_journeys"] == 1
     assert summary["known_excess_application_count"] == 1
+    assert summary["strict_excess_discount_amount"] == Decimal(200)
+    assert summary["strict_excess_discount_journeys"] == 1
+    assert summary["strict_excess_application_count"] == 1
+    assert outlets[("Dealer A", "Outlet 1")]["strict_excess_discount_amount"] == Decimal(200)
     assert outlets[("Dealer A", "Outlet 1")]["known_excess_discount_amount"] == Decimal(200)
+    assert outlets[("Dealer A", "Outlet 1")]["strict_excess_applications"] == 1
 
 
 def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None:
@@ -54,6 +59,9 @@ def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None
             "price_exception_journeys": 2,
             "discount_exception_journeys": 3,
             "invoice_conflict_journeys": 1,
+            "strict_excess_discount_amount": Decimal(1300),
+            "strict_excess_journeys": 4,
+            "strict_excess_applications": 5,
             "known_excess_discount_amount": Decimal(1250),
             "unknown_discount_applications": 2,
         },
@@ -63,6 +71,9 @@ def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None
             "price_exception_journeys": 1,
             "discount_exception_journeys": 2,
             "invoice_conflict_journeys": 0,
+            "strict_excess_discount_amount": Decimal(800),
+            "strict_excess_journeys": 2,
+            "strict_excess_applications": 3,
             "known_excess_discount_amount": Decimal(750),
             "unknown_discount_applications": 4,
         },
@@ -72,6 +83,9 @@ def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None
             "price_exception_journeys": 0,
             "discount_exception_journeys": 0,
             "invoice_conflict_journeys": 1,
+            "strict_excess_discount_amount": Decimal(0),
+            "strict_excess_journeys": 0,
+            "strict_excess_applications": 0,
             "known_excess_discount_amount": Decimal(0),
             "unknown_discount_applications": 0,
         },
@@ -84,6 +98,9 @@ def test_dealer_pricing_rollup_uses_all_outlets_and_canonical_exposure() -> None
         "price_exception_journeys": 3,
         "discount_exception_journeys": 5,
         "invoice_conflict_journeys": 1,
+        "strict_excess_applications": 8,
+        "strict_excess_discount_amount": Decimal(2100),
+        "strict_excess_journeys": 6,
         "known_excess_discount_amount": Decimal(2000),
         "unknown_discount_applications": 6,
     }
@@ -108,6 +125,9 @@ def test_discount_tolerance_and_unknown_entitlements_are_kept_separate() -> None
     assert summary["known_excess_discount_amount"] == Decimal(601)
     assert summary["known_excess_application_count"] == 2
     assert summary["unknown_entitlement_application_count"] == 2
+    assert summary["strict_excess_discount_amount"] == Decimal(701)
+    assert summary["strict_excess_application_count"] == 3
+    assert summary["strict_excess_discount_journeys"] == 3
     assert summary["by_discount_key"][0]["discount_key"] == "EXCHANGE_BONUS"
     assert _discount_entitlement(unattributed_mr) is None
 
