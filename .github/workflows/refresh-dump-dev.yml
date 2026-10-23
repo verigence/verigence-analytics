@@ -1,12 +1,12 @@
 name: Refresh Analytics Dump DEV
 
 # Refreshes after a successful DEV deployment, nightly at 03:00 Asia/Kolkata, or on demand.
-# The nightly run pulls fresh Audit Core data for all active DEV projects.
+# The nightly run pulls fresh Audit Core data for included DEV tenants.
 #
-# Active DEV tenants (from audit-core-live-baseline, 2026-09-30):
-#   MahindraOrissa  5fbe26ab-6ed7-444a-8488-5bfb81208588  (primary — has DI documents)
+# Analytics DEV tenant scope:
 #   Mahindra Orissa afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
 #   Hyundai Orissa  4c4bef2a-1d01-498f-98b4-e4f9311282fb
+# MahindraOrissa (5fbe26ab-6ed7-444a-8488-5bfb81208588) is intentionally excluded.
 
 on:
   workflow_run:
@@ -40,8 +40,8 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
       ANALYTICS_SERVICE: analytics
-      # All three active DEV project tenant IDs from audit-core-live-baseline 2026-09-30
-      DEFAULT_TENANT_IDS: "5fbe26ab-6ed7-444a-8488-5bfb81208588,afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572,4c4bef2a-1d01-498f-98b4-e4f9311282fb"
+      # Included DEV tenant IDs
+      DEFAULT_TENANT_IDS: "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572,4c4bef2a-1d01-498f-98b4-e4f9311282fb"
 
     steps:
       - uses: actions/checkout@v4
@@ -74,19 +74,18 @@ jobs:
           # Normalise: trim spaces, remove empty entries
           CLEANED="$(echo "$RESOLVED" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | tr '\n' ',')"
           CLEANED="${CLEANED%,}"
+          IFS=',' read -r -a REQUESTED_TENANTS <<< "$CLEANED"
+          for tenant in "${REQUESTED_TENANTS[@]}"; do
+            case "$tenant" in
+              afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572|4c4bef2a-1d01-498f-98b4-e4f9311282fb) ;;
+              *)
+                echo "::error::Tenant $tenant is not in Analytics DEV scope."
+                exit 1
+                ;;
+            esac
+          done
           echo "tenant_list=$CLEANED" >> "$GITHUB_OUTPUT"
           echo "Tenants to dump: $CLEANED"
-
-      - name: Dump MahindraOrissa (5fbe26ab)
-        if: contains(steps.tenants.outputs.tenant_list, '5fbe26ab-6ed7-444a-8488-5bfb81208588')
-        run: |
-          set -euo pipefail
-          echo "::group::Dumping MahindraOrissa"
-          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" \
-            python -m analytics.dump_cli \
-              --tenant '5fbe26ab-6ed7-444a-8488-5bfb81208588' \
-              --requested-by 'github-actions-auto'
-          echo "::endgroup::"
 
       - name: Dump Mahindra Orissa (afa9e32b)
         if: contains(steps.tenants.outputs.tenant_list, 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572')
@@ -141,7 +140,6 @@ jobs:
                   FROM analytics.dump_runs
                   WHERE status = 'COMPLETED'
                     AND tenant_id IN (
-                        '5fbe26ab-6ed7-444a-8488-5bfb81208588',
                         'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572',
                         '4c4bef2a-1d01-498f-98b4-e4f9311282fb'
                     )
@@ -170,7 +168,6 @@ jobs:
                   )
 
               missing = {
-                  '5fbe26ab-6ed7-444a-8488-5bfb81208588',
                   'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572',
                   '4c4bef2a-1d01-498f-98b4-e4f9311282fb',
               } - seen

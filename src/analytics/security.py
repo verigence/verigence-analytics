@@ -78,6 +78,8 @@ def require_analytics_read(
     tenant_id: str,
     principal: Annotated[Principal, Depends(get_principal)],
 ) -> Principal:
+    if tenant_id.strip() in load_settings(require_security=False).excluded_tenant_ids:
+        raise HTTPException(status_code=404, detail="No analytics data for tenant")
     try:
         decision = get_security_authorization_client().check_user_permission(
             user_id=principal.subject,
