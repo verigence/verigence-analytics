@@ -1040,7 +1040,27 @@ def insurance_intelligence(
             tenant_id,
             _DEAL_FACTS_CTE
             + """
-            SELECT COALESCE(insurer_name,'Unspecified') AS insurer_name,
+            , insurer_rows AS (
+                SELECT d.*,
+                       regexp_replace(upper(COALESCE(d.insurer_name,'')), '[^A-Z0-9]', '', 'g') AS insurer_key
+                FROM deal_facts d
+                WHERE has_booking AND has_insurance
+            ), normalized_insurers AS (
+                SELECT *,
+                       CASE
+                           WHEN insurer_key LIKE 'SBIGENERAL%' THEN 'SBI General Insurance'
+                           WHEN insurer_key LIKE 'IFFCOTOKIO%' THEN 'IFFCO Tokio General Insurance'
+                           WHEN insurer_key LIKE 'HDFCERGO%' THEN 'HDFC ERGO General Insurance'
+                           WHEN insurer_key LIKE 'UNIVERSALSOMPO%' THEN 'Universal Sompo General Insurance'
+                           WHEN insurer_key LIKE 'FUTUREGENERALI%' OR insurer_key LIKE 'GENERALICENTRAL%' THEN 'Generali Central Insurance'
+                           WHEN insurer_key LIKE 'THEORIENTALINSURANCE%' OR insurer_key LIKE 'ORIENTALINSURANCE%' THEN 'The Oriental Insurance Company'
+                           WHEN insurer_key LIKE 'NATIONALINSURANCE%' THEN 'National Insurance Company'
+                           WHEN insurer_key LIKE 'TATAAIG%' THEN 'Tata AIG General Insurance'
+                           ELSE COALESCE(NULLIF(trim(insurer_name),''),'Unspecified insurer')
+                       END AS normalized_insurer_name
+                FROM insurer_rows
+            )
+            SELECT normalized_insurer_name AS insurer_name,
                    count(*) FILTER (WHERE has_booking AND has_insurance)::int AS policy_count,
                    count(*) FILTER (
                        WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
@@ -1051,10 +1071,9 @@ def insurance_intelligence(
                    round(avg(actual_premium_amount) FILTER (
                        WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
                    ),2) AS avg_premium
-            FROM deal_facts
-            WHERE has_booking AND has_insurance
-            GROUP BY 1
-            ORDER BY policy_count DESC, insurer_name
+            FROM normalized_insurers
+            GROUP BY normalized_insurer_name
+            ORDER BY policy_count DESC, normalized_insurer_name
             """,
         )
         by_source = _rows(

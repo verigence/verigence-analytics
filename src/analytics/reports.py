@@ -227,7 +227,8 @@ def insurance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_
             ), policy_rows AS (
                 SELECT i.row_data->>'journey_id' AS journey_id,
                        COALESCE(NULLIF(i.row_data->>'insurance_by',''),'Unspecified') AS insurance_by,
-                       COALESCE(NULLIF(i.row_data->>'insurer_name',''),'Unspecified') AS insurer,
+                       COALESCE(NULLIF(trim(i.row_data->>'insurer_name'),''),'Unspecified insurer') AS raw_insurer,
+                       regexp_replace(upper(COALESCE(i.row_data->>'insurer_name','')), '[^A-Z0-9]', '', 'g') AS insurer_key,
                        upper(NULLIF(i.row_data->>'insurance_source','')) AS source_code,
                        NULLIF(i.row_data->>'self_insurance_flag','')::boolean AS self_insurance_flag,
                        NULLIF(i.row_data->>'actual_premium_amount','')::numeric AS premium_amount
@@ -235,6 +236,20 @@ def insurance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_
                 JOIN booked b ON b.journey_id=i.row_data->>'journey_id'
                 WHERE i.tenant_id=:tenant_id AND i.dump_id=:dump_id
                   AND i.source_table='insurance_records'
+            ), normalized_policy_rows AS (
+                SELECT *,
+                       CASE
+                           WHEN insurer_key LIKE 'SBIGENERAL%' THEN 'SBI General Insurance'
+                           WHEN insurer_key LIKE 'IFFCOTOKIO%' THEN 'IFFCO Tokio General Insurance'
+                           WHEN insurer_key LIKE 'HDFCERGO%' THEN 'HDFC ERGO General Insurance'
+                           WHEN insurer_key LIKE 'UNIVERSALSOMPO%' THEN 'Universal Sompo General Insurance'
+                           WHEN insurer_key LIKE 'FUTUREGENERALI%' OR insurer_key LIKE 'GENERALICENTRAL%' THEN 'Generali Central Insurance'
+                           WHEN insurer_key LIKE 'THEORIENTALINSURANCE%' OR insurer_key LIKE 'ORIENTALINSURANCE%' THEN 'The Oriental Insurance Company'
+                           WHEN insurer_key LIKE 'NATIONALINSURANCE%' THEN 'National Insurance Company'
+                           WHEN insurer_key LIKE 'TATAAIG%' THEN 'Tata AIG General Insurance'
+                           ELSE raw_insurer
+                       END AS insurer
+                FROM policy_rows
             )
             SELECT insurance_by,
                    insurer,
@@ -246,7 +261,7 @@ def insurance(tenant_id: str, _: Annotated[Principal, Depends(require_analytics_
                    count(*)::int AS policy_count,
                    count(*) FILTER (WHERE premium_amount IS NOT NULL)::int AS premium_populated,
                    COALESCE(sum(premium_amount),0) AS premium_amount
-            FROM policy_rows
+            FROM normalized_policy_rows
             GROUP BY 1,2,3 ORDER BY policy_count DESC, insurance_by, insurer
             """, tenant_id=tenant_id, dump_id=latest["dump_id"])
         summary = _query_rows(connection, """
