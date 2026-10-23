@@ -92,15 +92,7 @@ vehicles AS (
 ),
 finance AS (
     SELECT row_data->>'journey_id' AS journey_id,
-           string_agg(
-               DISTINCT NULLIF(row_data->>'provider_name',''),
-               ', ' ORDER BY NULLIF(row_data->>'provider_name','')
-           ) AS finance_provider,
-           string_agg(
-               DISTINCT NULLIF(row_data->>'finance_type_code',''),
-               ', ' ORDER BY NULLIF(row_data->>'finance_type_code','')
-           ) AS finance_type,
-           sum(NULLIF(row_data->>'financed_amount','')::numeric) AS financed_amount
+           count(*)::int AS finance_record_count
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='finance_records'
     GROUP BY 1
@@ -246,19 +238,7 @@ discounts AS (
 payments AS (
     SELECT row_data->>'journey_id' AS journey_id,
            count(*)::int AS payment_count,
-           sum(NULLIF(row_data->>'amount','')::numeric) AS payment_amount,
-           sum(NULLIF(row_data->>'amount','')::numeric) FILTER (
-               WHERE NULLIF(row_data->>'payment_stage','')='BOOKING'
-           ) AS booking_payment_amount,
-           sum(NULLIF(row_data->>'amount','')::numeric) FILTER (
-               WHERE NULLIF(row_data->>'payment_stage','')='DELIVERY'
-           ) AS delivery_payment_amount,
-           min(
-               COALESCE(
-                   NULLIF(row_data->>'receipt_date','')::timestamp,
-                   NULLIF(row_data->>'payment_at_utc','')::timestamptz
-               )
-           ) AS first_payment_at
+           sum(NULLIF(row_data->>'amount','')::numeric) AS payment_amount
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='payments'
     GROUP BY 1
@@ -284,7 +264,9 @@ findings AS (
 geography AS (
     SELECT row_data->>'journey_id' AS journey_id,
            NULLIF(row_data->>'customer_pincode','') AS customer_pincode,
-           NULLIF(row_data->>'source_field_key','') AS geography_source_field
+           NULLIF(row_data->>'source_field_key','') AS geography_source_field,
+           NULLIF(row_data->>'source_reviewed_at_utc','')::timestamptz AS geography_reviewed_at_utc,
+           NULLIF(row_data->>'source_confidence_score','')::numeric AS geography_confidence_score
     FROM analytics.snapshot_rows
     WHERE tenant_id=:tenant_id AND dump_id=:dump_id
       AND source_table='derived_customer_geography'
@@ -325,9 +307,6 @@ deal_facts AS (
            dl.actual_delivered_at,
            v.allocated_at_utc,
            (f.journey_id IS NOT NULL) AS has_finance,
-           f.finance_provider,
-           f.finance_type,
-           f.financed_amount,
            (i.journey_id IS NOT NULL) AS has_insurance,
            i.insurance_by,
            i.insurer_name,
@@ -336,7 +315,8 @@ deal_facts AS (
            i.self_insurance_flag,
            i.insurance_add_ons,
            i.insurance_source,
-           (i.journey_id IS NOT NULL AND COALESCE(i.insurance_source,'INHOUSE') = 'INHOUSE') AS has_inhouse_insurance,
+           (i.journey_id IS NOT NULL AND i.insurance_source = 'INHOUSE') AS has_inhouse_insurance,
+           (i.journey_id IS NOT NULL AND (i.insurance_source = 'SELF' OR i.self_insurance_flag IS TRUE)) AS has_self_insurance,
            (t.journey_id IS NOT NULL) AS has_trade_in,
            t.trade_in_quoted_value,
            t.trade_in_actual_value,
@@ -369,15 +349,14 @@ deal_facts AS (
            COALESCE(di.has_excess_on_any_key,false) AS has_excess_on_any_key,
            COALESCE(py.payment_count,0) AS payment_count,
            COALESCE(py.payment_amount,0) AS payment_amount,
-           COALESCE(py.booking_payment_amount,0) AS booking_payment_amount,
-           COALESCE(py.delivery_payment_amount,0) AS delivery_payment_amount,
-           py.first_payment_at,
            COALESCE(fi.finding_count,0) AS finding_count,
            COALESCE(fi.open_finding_count,0) AS open_finding_count,
            COALESCE(fi.high_finding_count,0) AS high_finding_count,
            COALESCE(fi.missing_document_flag_count,0) AS missing_document_flag_count,
            g.customer_pincode,
            g.geography_source_field,
+           g.geography_reviewed_at_utc,
+           g.geography_confidence_score,
            COALESCE(mr.mr_opted, false) AS mr_opted,
            mr.mr_amount,
            mr.mr_set_by_role
@@ -1021,6 +1000,12 @@ def insurance_intelligence(
                        count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
                        count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insurance_journeys,
                        count(*) FILTER (
+                           WHERE has_booking AND has_insurance
+                             AND (insurance_source IS NULL
+                                  OR insurance_source NOT IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE'))
+                             AND self_insurance_flag IS NOT TRUE
+                       )::int AS source_unknown_journeys,
+                       count(*) FILTER (
                            WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
                        )::int AS premium_populated,
                        COALESCE(sum(actual_premium_amount) FILTER (
@@ -1043,7 +1028,7 @@ def insurance_intelligence(
         )
         total_journeys = int(summary.get("booked_journeys") or 0)
         insurance_journeys = int(summary.get("insurance_journeys") or 0)
-        summary["insurance_penetration_pct"] = _rate(insurance_journeys, total_journeys)
+        summary["insurance_record_rate_pct"] = _rate(insurance_journeys, total_journeys)
         summary["add_on_policy_attach_pct"] = _rate(
             summary.get("policies_with_add_ons") or 0,
             insurance_journeys,
@@ -1084,6 +1069,36 @@ def insurance_intelligence(
             WHERE has_booking AND has_insurance
             GROUP BY 1
             ORDER BY policy_count DESC, insurance_by
+            """,
+        )
+        by_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT dealer_name,
+                   outlet_name,
+                   count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
+                   count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insurance_journeys,
+                   count(*) FILTER (
+                       WHERE has_booking AND has_insurance
+                         AND (insurance_source IS NULL
+                              OR insurance_source NOT IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE'))
+                         AND self_insurance_flag IS NOT TRUE
+                   )::int AS source_unknown_journeys,
+                   count(*) FILTER (
+                       WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
+                   )::int AS premium_populated,
+                   COALESCE(sum(actual_premium_amount) FILTER (
+                       WHERE has_booking AND has_insurance
+                   ),0) AS premium_amount,
+                   round(avg(actual_premium_amount) FILTER (
+                       WHERE has_booking AND has_insurance AND actual_premium_amount IS NOT NULL
+                   ),2) AS avg_premium
+            FROM deal_facts
+            GROUP BY dealer_name, outlet_name
+            ORDER BY insurance_journeys DESC, dealer_name, outlet_name
             """,
         )
         add_ons = _rows(
@@ -1130,7 +1145,13 @@ def insurance_intelligence(
         "summary": summary,
         "by_insurer": by_insurer,
         "by_source": by_source,
+        "by_outlet": by_outlet,
         "add_ons": add_ons,
+        "definition": (
+            "Insurance record rate is captured policy records divided by booked journeys; it is not "
+            "proof that unrecorded journeys were uninsured. Source-coded in-house/self mix is "
+            "reported only when insurance_source or the explicit self-insurance flag is populated."
+        ),
     }
 
 
@@ -1233,6 +1254,28 @@ def vas_intelligence(
             ORDER BY journey_count DESC, d.dealer_name, o.outlet_name, a.addon_type
             """,
         )
+        by_model_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT dealer_name,
+                   outlet_name,
+                   COALESCE(NULLIF(model_name,''),'Unresolved') AS model_name,
+                   COALESCE(NULLIF(variant_name,''),'Unresolved') AS variant_name,
+                   count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
+                   count(*) FILTER (WHERE has_booking AND has_accessories)::int AS attached_journeys,
+                   COALESCE(sum(accessories_value) FILTER (WHERE has_booking),0) AS actual_amount,
+                   round(100.0 * count(*) FILTER (WHERE has_booking AND has_accessories)
+                         / NULLIF(count(*) FILTER (WHERE has_booking),0),1) AS penetration_pct
+            FROM deal_facts
+            GROUP BY dealer_name, outlet_name, model_name, variant_name
+            HAVING count(*) FILTER (WHERE has_booking AND has_accessories) > 0
+            ORDER BY actual_amount DESC, attached_journeys DESC,
+                     dealer_name, outlet_name, model_name, variant_name
+            """,
+        )
     finally:
         connection.close()
 
@@ -1242,7 +1285,13 @@ def vas_intelligence(
         "journeys": total_journeys,
         "by_type": by_type,
         "by_outlet": by_outlet,
+        "by_model_outlet": by_model_outlet,
         "accessory_codes": ["ACCESSORY", "ACCESSORIES", "ACCESSORIES_TOTAL"],
+        "definition": (
+            "Accessory value is the captured ACCESSORY/ACCESSORIES/ACCESSORIES_TOTAL category total. "
+            "This snapshot does not contain individual accessory SKU or quantity detail; model labels "
+            "are displayed as captured and may need catalogue normalization."
+        ),
     }
 
 
@@ -1387,9 +1436,14 @@ def customer_geography(
                 tenant_id,
                 _DEAL_FACTS_CTE
                 + """
-                SELECT count(*)::int AS journeys,
-                       count(*) FILTER (WHERE customer_pincode IS NOT NULL)::int
-                           AS journeys_with_pincode
+                SELECT count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
+                       count(*) FILTER (
+                           WHERE has_booking AND customer_pincode IS NOT NULL
+                       )::int AS journeys_with_pincode,
+                       count(*) FILTER (
+                           WHERE has_booking AND customer_pincode IS NOT NULL
+                             AND geography_reviewed_at_utc IS NOT NULL
+                       )::int AS reviewed_journeys
                 FROM deal_facts
                 """,
             )
@@ -1414,7 +1468,7 @@ def customer_geography(
                        WHERE actual_discount_present
                    ),2) AS avg_discount
             FROM deal_facts
-            WHERE customer_pincode IS NOT NULL
+            WHERE customer_pincode IS NOT NULL AND has_booking
             GROUP BY customer_pincode, dealer_name, outlet_name, model_name
             ORDER BY journey_count DESC, customer_pincode, dealer_name, outlet_name, model_name
             """,
@@ -1422,12 +1476,20 @@ def customer_geography(
     finally:
         connection.close()
 
-    journeys = int(total.get("journeys") or 0)
+    journeys = int(total.get("booked_journeys") or 0)
     with_pin = int(total.get("journeys_with_pincode") or 0)
+    reviewed = int(total.get("reviewed_journeys") or 0)
     return {
         "tenant_id": tenant_id,
         "data_as_of": latest["data_as_of_utc"],
         "coverage": _coverage_metric(with_pin, journeys),
+        "quality": {
+            "reviewed_journeys": reviewed,
+            "provisional_journeys": max(with_pin - reviewed, 0),
+            "reviewed_pct_of_pincode_records": _rate(reviewed, with_pin),
+            "source_field": "address_pincode",
+            "source_note": "Document-extracted values remain provisional until reviewed in Audit Core.",
+        },
         "available": with_pin > 0,
         "rows": rows,
         "privacy": (
@@ -2069,20 +2131,23 @@ def insurance_source_split(
                 tenant_id,
                 _DEAL_FACTS_CTE
                 + """
-                SELECT count(*)::int AS journeys,
-                       count(*) FILTER (WHERE has_insurance)::int AS insurance_journeys,
-                       count(*) FILTER (WHERE has_inhouse_insurance)::int AS inhouse_journeys,
+                SELECT count(*) FILTER (WHERE has_booking)::int AS journeys,
+                       count(*) FILTER (WHERE has_booking AND has_insurance)::int AS insurance_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_inhouse_insurance)::int AS inhouse_journeys,
                        count(*) FILTER (
-                           WHERE has_insurance AND insurance_source = 'SELF'
+                           WHERE has_booking AND has_insurance AND has_self_insurance
                        )::int AS self_journeys,
                        count(*) FILTER (
-                           WHERE has_insurance AND insurance_source IS NULL
+                           WHERE has_booking AND has_insurance
+                             AND (insurance_source IS NULL
+                                  OR insurance_source NOT IN ('INHOUSE','SELF','EXTERNAL','OUTSIDE'))
+                             AND self_insurance_flag IS NOT TRUE
                        )::int AS source_unknown_journeys,
                        COALESCE(sum(actual_premium_amount) FILTER (
-                           WHERE has_inhouse_insurance
+                           WHERE has_booking AND has_inhouse_insurance
                        ),0) AS inhouse_premium_total,
                        round(avg(actual_premium_amount) FILTER (
-                           WHERE has_inhouse_insurance AND actual_premium_amount IS NOT NULL
+                           WHERE has_booking AND has_inhouse_insurance AND actual_premium_amount IS NOT NULL
                        ),2) AS avg_inhouse_premium
                 FROM deal_facts
                 """,
@@ -2102,13 +2167,13 @@ def insurance_source_split(
             _DEAL_FACTS_CTE
             + """
             SELECT dealer_name, outlet_name,
-                   count(*)::int AS journeys,
-                   count(*) FILTER (WHERE has_inhouse_insurance)::int AS inhouse_journeys,
+                   count(*) FILTER (WHERE has_booking)::int AS journeys,
+                   count(*) FILTER (WHERE has_booking AND has_inhouse_insurance)::int AS inhouse_journeys,
                    count(*) FILTER (
-                       WHERE has_insurance AND insurance_source = 'SELF'
+                       WHERE has_booking AND has_insurance AND has_self_insurance
                    )::int AS self_journeys,
                    COALESCE(sum(actual_premium_amount) FILTER (
-                       WHERE has_inhouse_insurance
+                       WHERE has_booking AND has_inhouse_insurance
                    ),0) AS inhouse_premium_total
             FROM deal_facts
             GROUP BY dealer_name, outlet_name
@@ -2130,15 +2195,15 @@ def insurance_source_split(
             _DEAL_FACTS_CTE
             + """
             SELECT COALESCE(insurer_name,'Unspecified') AS insurer_name,
-                   count(*) FILTER (WHERE has_inhouse_insurance)::int AS policy_count,
+                   count(*) FILTER (WHERE has_booking AND has_inhouse_insurance)::int AS policy_count,
                    COALESCE(sum(actual_premium_amount) FILTER (
-                       WHERE has_inhouse_insurance
+                       WHERE has_booking AND has_inhouse_insurance
                    ),0) AS premium_total,
                    round(avg(actual_premium_amount) FILTER (
-                       WHERE has_inhouse_insurance AND actual_premium_amount IS NOT NULL
+                       WHERE has_booking AND has_inhouse_insurance AND actual_premium_amount IS NOT NULL
                    ),2) AS avg_premium
             FROM deal_facts
-            WHERE has_inhouse_insurance
+            WHERE has_booking AND has_inhouse_insurance
             GROUP BY 1
             ORDER BY policy_count DESC, insurer_name
             """,
@@ -2154,8 +2219,8 @@ def insurance_source_split(
         "by_insurer_inhouse": by_insurer_inhouse,
         "note": (
             "inhouse_penetration_pct counts only INHOUSE-sourced insurance as dealer revenue. "
-            "SELF-sourced insurance is customer-arranged and excluded from dealer penetration. "
-            "Journeys where insurance_source is NULL are treated as INHOUSE (legacy default)."
+            "SELF-sourced insurance is counted only when an explicit source or self-insurance flag is present. "
+            "Uncoded source records remain unknown and are excluded from both in-house and self categories."
         ),
     }
 
@@ -2279,5 +2344,305 @@ def dealer_discount_grid(
             "as the two discount types that consume the agreed dealer buffer per model. "
             "Model matching is case-insensitive text match between grid model_alias and "
             "journey model_name — use the unmatched_grid_models list to identify alias mismatches."
+        ),
+    }
+
+
+@router.get("/finance")
+def finance_intelligence(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Finance attach and confidence-qualified lender disbursement reporting."""
+    connection, latest = _latest_context(tenant_id)
+    try:
+        summary = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                _DEAL_FACTS_CTE
+                + """
+                , finance_rows AS (
+                    SELECT row_data->>'journey_id' AS journey_id,
+                           upper(COALESCE(NULLIF(row_data->>'loan_disbursement_confidence',''), 'UNVERIFIED')) AS confidence,
+                           NULLIF(row_data->>'loan_disbursement_amount','')::numeric AS loan_amount
+                    FROM analytics.snapshot_rows
+                    WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                      AND source_table='finance_records'
+                )
+                SELECT count(*) FILTER (WHERE has_booking)::int AS booked_journeys,
+                       count(*) FILTER (WHERE has_booking AND has_finance)::int AS financed_journeys,
+                       round(100.0 * count(*) FILTER (WHERE has_booking AND has_finance)
+                             / NULLIF(count(*) FILTER (WHERE has_booking),0),1) AS finance_record_attach_pct,
+                       (SELECT count(*)::int FROM finance_rows fr
+                        JOIN deal_facts d USING (journey_id) WHERE d.has_booking) AS finance_record_count,
+                       (SELECT count(*)::int FROM finance_rows fr
+                        JOIN deal_facts d USING (journey_id)
+                        WHERE d.has_booking AND fr.confidence='HIGH' AND fr.loan_amount IS NOT NULL)
+                           AS high_confidence_loan_records,
+                       (SELECT COALESCE(sum(fr.loan_amount),0) FROM finance_rows fr
+                        JOIN deal_facts d USING (journey_id)
+                        WHERE d.has_booking AND fr.confidence='HIGH')
+                           AS high_confidence_loan_amount,
+                       (SELECT count(*)::int FROM finance_rows fr
+                        JOIN deal_facts d USING (journey_id)
+                        WHERE d.has_booking AND fr.confidence='MEDIUM' AND fr.loan_amount IS NOT NULL)
+                           AS medium_confidence_loan_records,
+                       (SELECT COALESCE(sum(fr.loan_amount),0) FROM finance_rows fr
+                        JOIN deal_facts d USING (journey_id)
+                        WHERE d.has_booking AND fr.confidence='MEDIUM')
+                           AS medium_confidence_loan_amount,
+                       (SELECT count(*)::int FROM finance_rows fr
+                        JOIN deal_facts d USING (journey_id)
+                        WHERE d.has_booking AND (fr.loan_amount IS NULL OR fr.confidence NOT IN ('HIGH','MEDIUM')))
+                           AS unverified_or_missing_loan_records
+                FROM deal_facts
+                """,
+            )
+        )
+        summary["loan_amount_capture_pct"] = _rate(
+            int(summary.get("high_confidence_loan_records") or 0)
+            + int(summary.get("medium_confidence_loan_records") or 0),
+            int(summary.get("finance_record_count") or 0),
+        )
+
+        finance_scope = _DEAL_FACTS_CTE + """
+        , finance_rows AS (
+            SELECT row_data->>'journey_id' AS journey_id,
+                   upper(COALESCE(NULLIF(row_data->>'loan_disbursement_confidence',''), 'UNVERIFIED')) AS confidence,
+                   NULLIF(row_data->>'loan_disbursement_amount','')::numeric AS loan_amount,
+                   NULLIF(row_data->>'provider_name','') AS provider_name,
+                   COALESCE(NULLIF(row_data->>'finance_type_code',''),'UNSPECIFIED') AS finance_type
+            FROM analytics.snapshot_rows
+            WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+              AND source_table='finance_records'
+        ), scoped_finance AS (
+            SELECT d.dealer_id,
+                   d.dealer_name,
+                   d.outlet_id,
+                   d.outlet_name,
+                   f.journey_id,
+                   f.confidence,
+                   f.loan_amount,
+                   f.finance_type,
+                   CASE
+                     WHEN f.confidence <> 'HIGH' THEN 'Lender not verified'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'HDFC%' THEN 'HDFC Bank'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'AXISBANK%' THEN 'Axis Bank'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'STATEBANK%' OR regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'SBI%' THEN 'State Bank of India'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'UCOBANK%' THEN 'UCO Bank'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'BANKOFBARODA%' OR regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'BOB%' THEN 'Bank of Baroda'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'PUNJABANDSIND%' THEN 'Punjab & Sind Bank'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'ICICIBANK%' THEN 'ICICI Bank'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'KOTAK%' THEN 'Kotak Mahindra Bank'
+                     WHEN regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'MMFSL%' OR regexp_replace(upper(COALESCE(f.provider_name,'')), '[^A-Z0-9]', '', 'g') LIKE 'MAHINDRAANDMAHINDRAFINANCIAL%' THEN 'Mahindra Finance'
+                     WHEN NULLIF(trim(f.provider_name),'') IS NOT NULL THEN trim(f.provider_name)
+                     ELSE 'High-confidence lender not named'
+                   END AS lender_name
+            FROM finance_rows f
+            JOIN deal_facts d ON d.journey_id=f.journey_id AND d.has_booking
+        )
+        """
+        by_lender = _rows(
+            connection,
+            latest,
+            tenant_id,
+            finance_scope
+            + """
+            SELECT lender_name,
+                   finance_type,
+                   count(*)::int AS finance_record_count,
+                   count(DISTINCT journey_id)::int AS financed_journeys,
+                   COALESCE(sum(loan_amount),0) AS loan_amount
+            FROM scoped_finance
+            WHERE confidence='HIGH' AND loan_amount IS NOT NULL
+            GROUP BY lender_name, finance_type
+            ORDER BY loan_amount DESC, financed_journeys DESC, lender_name
+            """,
+        )
+        by_lender_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            finance_scope
+            + """
+            SELECT dealer_name,
+                   outlet_name,
+                   lender_name,
+                   confidence,
+                   count(*)::int AS finance_record_count,
+                   count(DISTINCT journey_id)::int AS financed_journeys,
+                   COALESCE(sum(loan_amount),0) AS loan_amount
+            FROM scoped_finance
+            GROUP BY dealer_name, outlet_name, lender_name, confidence
+            ORDER BY dealer_name, outlet_name, loan_amount DESC, lender_name
+            """,
+        )
+        by_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            finance_scope
+            + """
+            , booked AS (
+                SELECT dealer_id, dealer_name, outlet_id, outlet_name,
+                       count(*)::int AS booked_journeys
+                FROM deal_facts
+                WHERE has_booking
+                GROUP BY dealer_id, dealer_name, outlet_id, outlet_name
+            ), financed AS (
+                SELECT dealer_id, dealer_name, outlet_id, outlet_name,
+                       count(DISTINCT journey_id)::int AS financed_journeys,
+                       count(*) FILTER (WHERE confidence='HIGH' AND loan_amount IS NOT NULL)::int AS high_confidence_records,
+                       COALESCE(sum(loan_amount) FILTER (WHERE confidence='HIGH'),0) AS high_confidence_amount,
+                       count(*) FILTER (WHERE confidence='MEDIUM' AND loan_amount IS NOT NULL)::int AS medium_confidence_records,
+                       COALESCE(sum(loan_amount) FILTER (WHERE confidence='MEDIUM'),0) AS medium_confidence_amount
+                FROM scoped_finance
+                GROUP BY dealer_id, dealer_name, outlet_id, outlet_name
+            )
+            SELECT b.dealer_name,
+                   b.outlet_name,
+                   b.booked_journeys,
+                   COALESCE(f.financed_journeys,0)::int AS financed_journeys,
+                   round(100.0 * COALESCE(f.financed_journeys,0) / NULLIF(b.booked_journeys,0),1) AS finance_record_attach_pct,
+                   COALESCE(f.high_confidence_records,0)::int AS high_confidence_loan_records,
+                   COALESCE(f.high_confidence_amount,0) AS high_confidence_loan_amount,
+                   COALESCE(f.medium_confidence_records,0)::int AS medium_confidence_loan_records,
+                   COALESCE(f.medium_confidence_amount,0) AS medium_confidence_loan_amount
+            FROM booked b
+            LEFT JOIN financed f USING (dealer_id, dealer_name, outlet_id, outlet_name)
+            ORDER BY high_confidence_loan_amount DESC, financed_journeys DESC,
+                     dealer_name, outlet_name
+            """,
+        )
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "summary": summary,
+        "by_lender": by_lender,
+        "by_lender_outlet": by_lender_outlet,
+        "by_outlet": by_outlet,
+        "definition": (
+            "Finance record attach is distinct booked journeys with a finance record divided by booked journeys. "
+            "Lender attribution and confirmed loan totals use only HIGH-confidence loan disbursement matches. "
+            "MEDIUM-confidence amounts are shown separately and not attributed to a lender. A loan-to-vehicle-price "
+            "percentage is unavailable without complete, comparable net vehicle prices. The legacy financed_amount "
+            "field is not used because its current values are not credible loan sizes."
+        ),
+    }
+
+
+@router.get("/payments")
+def payments_intelligence(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    """Recorded receipt value by safe normalized channel and dealership."""
+    connection, latest = _latest_context(tenant_id)
+    payment_scope = _DEAL_FACTS_CTE + """
+    , payment_rows AS (
+        SELECT row_data->>'journey_id' AS journey_id,
+               upper(COALESCE(NULLIF(row_data->>'payment_mode_code',''),'UNSPECIFIED')) AS mode_code,
+               upper(COALESCE(NULLIF(row_data->>'payment_method_code',''),'')) AS method_code,
+               NULLIF(row_data->>'amount','')::numeric AS amount,
+               NULLIF(row_data->>'actual_status_code','') AS status_code
+        FROM analytics.snapshot_rows
+        WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='payments'
+    ), scoped_payments AS (
+        SELECT d.dealer_id,
+               d.dealer_name,
+               d.outlet_id,
+               d.outlet_name,
+               p.journey_id,
+               p.amount,
+               p.status_code,
+               CASE
+                 WHEN p.method_code ~ '^(UPI|PHONEPE|PHONE[[:space:]]PAY|GPAY|GOOGLE[[:space:]]PAY)([[:space:]/_-]|$)' THEN 'UPI'
+                 WHEN p.method_code ~ '^RTGS([[:space:]/_-]|$)' THEN 'RTGS'
+                 WHEN p.method_code ~ '^NEFT([[:space:]/_-]|$)' THEN 'NEFT'
+                 WHEN p.method_code ~ '^IMPS([[:space:]/_-]|$)' THEN 'IMPS'
+                 WHEN p.method_code ~ '^CASH([[:space:]/_-]|$)' THEN 'CASH'
+                 WHEN p.method_code ~ '^(CHEQUE|CHQ)([[:space:]/_-]|$)' THEN 'CHEQUE'
+                 WHEN p.method_code ~ '^(CARD|DEBIT|CREDIT|VISA|MASTERCARD|RUPAY)([[:space:]/_-]|$)' THEN 'CARD'
+                 WHEN p.mode_code IN ('RTGS','NEFT','IMPS','CASH','CHEQUE','BANK_TRANSFER') THEN p.mode_code
+                 ELSE 'OTHER / UNMAPPED'
+               END AS channel
+        FROM payment_rows p
+        JOIN deal_facts d ON d.journey_id=p.journey_id AND d.has_booking
+    )
+    """
+    try:
+        summary = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                payment_scope
+                + """
+                SELECT count(*)::int AS payment_entry_count,
+                       count(DISTINCT journey_id)::int AS journeys_with_payment_entries,
+                       COALESCE(sum(amount),0) AS recorded_receipt_amount,
+                       count(*) FILTER (WHERE status_code IS NOT NULL)::int AS status_coded_entries,
+                       round(100.0 * count(*) FILTER (WHERE status_code IS NOT NULL)
+                             / NULLIF(count(*),0),1) AS status_coverage_pct,
+                       count(DISTINCT channel)::int AS channel_count,
+                       count(*) FILTER (WHERE channel='OTHER / UNMAPPED')::int AS unmapped_entries
+                FROM scoped_payments
+                """,
+            )
+        )
+        by_channel = _rows(
+            connection,
+            latest,
+            tenant_id,
+            payment_scope
+            + """
+            SELECT channel,
+                   count(*)::int AS payment_entry_count,
+                   count(DISTINCT journey_id)::int AS journey_count,
+                   COALESCE(sum(amount),0) AS recorded_receipt_amount,
+                   count(*) FILTER (WHERE status_code IS NOT NULL)::int AS status_coded_entries
+            FROM scoped_payments
+            GROUP BY channel
+            ORDER BY recorded_receipt_amount DESC, payment_entry_count DESC, channel
+            """,
+        )
+        by_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            payment_scope
+            + """
+            SELECT dealer_name,
+                   outlet_name,
+                   channel,
+                   count(*)::int AS payment_entry_count,
+                   count(DISTINCT journey_id)::int AS journey_count,
+                   COALESCE(sum(amount),0) AS recorded_receipt_amount,
+                   count(*) FILTER (WHERE status_code IS NOT NULL)::int AS status_coded_entries
+            FROM scoped_payments
+            GROUP BY dealer_name, outlet_name, channel
+            ORDER BY dealer_name, outlet_name, recorded_receipt_amount DESC, channel
+            """,
+        )
+    finally:
+        connection.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "data_as_of": latest["data_as_of_utc"],
+        "summary": summary,
+        "by_channel": by_channel,
+        "by_outlet": by_outlet,
+        "definition": (
+            "Recorded receipt amounts are the amounts present in payment records. Missing payment status is not treated "
+            "as settled; status_coverage_pct shows how many entries have a status code. Channel aliases are normalized "
+            "only from anchored, recognized prefixes; raw payment references, remarks, and customer details are never "
+            "returned. Booking/delivery stage is omitted because the source field is sparsely populated and not reliable "
+            "enough for a stage split."
         ),
     }

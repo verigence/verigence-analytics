@@ -146,60 +146,52 @@ def _copy_derived_customer_geography(
     dump_id: UUID,
     batch_size: int,
 ) -> int:
-    """Derive a privacy-safe journey PIN without copying the source address.
+    """Copy only an explicit six-digit customer PIN and its review provenance.
 
-    Address facts remain in Audit Core. Analytics stores only the selected six-digit
-    Indian PIN and provenance needed to explain the derivation.
+    The extracted-field table contains address data, so this query intentionally
+    reads only ``address_pincode`` and never persists a full address in Analytics.
     """
     schema = _identifier(source_schema)
     query = text(
         f"""
-        WITH address_facts AS (
-            SELECT evidence_fact_id,
+        WITH explicit_pins AS (
+            SELECT extracted_field_id,
                    journey_id,
                    evidence_id,
                    field_key,
-                   (regexp_match(
-                       normalized_value,
-                       '(^|[^0-9])([1-9][0-9]{{{{5}}}})([^0-9]|$)'
-                   ))[2] AS customer_pincode
-            FROM {schema}.evidence_facts
+                   trim(effective_value #>> '{{}}') AS normalized_value,
+                   is_modified,
+                   reviewed_at_utc,
+                   confidence_score,
+                   created_at_utc
+            FROM {schema}.journey_document_extracted_fields
             WHERE tenant_id = :tenant_id
-              AND superseded_at_utc IS NULL
-              AND NULLIF(normalized_value, '') IS NOT NULL
-              AND field_key IN (
-                  'customer_address',
-                  'aadhaar_address',
-                  'service_address',
-                  'voter_address',
-                  'licence_address'
-              )
+              AND field_key = 'address_pincode'
+              AND jsonb_typeof(effective_value) = 'string'
+              AND trim(effective_value #>> '{{}}') ~ '^[1-9][0-9]{{5}}$'
         ),
         ranked AS (
             SELECT *,
                    row_number() OVER (
                        PARTITION BY journey_id
                        ORDER BY
-                           CASE field_key
-                               WHEN 'customer_address' THEN 1
-                               WHEN 'aadhaar_address' THEN 2
-                               WHEN 'service_address' THEN 3
-                               WHEN 'voter_address' THEN 4
-                               WHEN 'licence_address' THEN 5
-                               ELSE 99
-                           END,
-                           evidence_fact_id
+                           (reviewed_at_utc IS NOT NULL) DESC,
+                           confidence_score DESC NULLS LAST,
+                           created_at_utc DESC NULLS LAST,
+                           extracted_field_id
                    ) AS preference_rank
-            FROM address_facts
-            WHERE customer_pincode IS NOT NULL
+            FROM explicit_pins
         )
-        SELECT CAST(evidence_fact_id AS text) AS source_pk,
+        SELECT CAST(extracted_field_id AS text) AS source_pk,
                jsonb_build_object(
                    'journey_id', CAST(journey_id AS text),
-                   'customer_pincode', customer_pincode,
+                   'customer_pincode', normalized_value,
                    'source_field_key', field_key,
                    'source_evidence_id', CAST(evidence_id AS text),
-                   'derivation_method', 'INDIAN_PIN_FROM_ADDRESS'
+                   'derivation_method', 'EXPLICIT_ADDRESS_PINCODE',
+                   'source_reviewed_at_utc', reviewed_at_utc,
+                   'source_confidence_score', confidence_score,
+                   'source_is_modified', COALESCE(is_modified, false)
                ) AS row_data
         FROM ranked
         WHERE preference_rank = 1
