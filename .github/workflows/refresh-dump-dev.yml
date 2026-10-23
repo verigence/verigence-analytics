@@ -12,9 +12,14 @@ on:
   workflow_run:
     workflows: ["Deploy Analytics DEV"]
     types: [completed]
-    branches: [main, analytics]
+    branches: [analytics]
   schedule:
     - cron: '30 21 * * *' # 03:00 Asia/Kolkata
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/refresh-dump-dev.yml"
+      - "scripts/verify_business_reports.py"
   workflow_dispatch:
     inputs:
       tenant_ids:
@@ -32,7 +37,7 @@ concurrency:
 
 jobs:
   dump:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'push' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -46,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: analytics
 
       - uses: actions/setup-python@v5
         with:
@@ -90,7 +95,7 @@ jobs:
           echo "Tenants to dump: $CLEANED"
 
       - name: Dump Mahindra Orissa (afa9e32b)
-        if: contains(steps.tenants.outputs.tenant_list, 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572')
+        if: github.event_name != 'push' && contains(steps.tenants.outputs.tenant_list, 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572')
         run: |
           set -euo pipefail
           echo "::group::Dumping Mahindra Orissa"
@@ -101,7 +106,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Dump Hyundai Orissa (4c4bef2a)
-        if: contains(steps.tenants.outputs.tenant_list, '4c4bef2a-1d01-498f-98b4-e4f9311282fb')
+        if: github.event_name != 'push' && contains(steps.tenants.outputs.tenant_list, '4c4bef2a-1d01-498f-98b4-e4f9311282fb')
         run: |
           set -euo pipefail
           echo "::group::Dumping Hyundai Orissa"
