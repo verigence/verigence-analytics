@@ -1,7 +1,7 @@
 name: Refresh Analytics Dump DEV
 
-# Runs automatically after every successful Analytics deployment to DEV.
-# Also runnable manually to pull fresh audit-core data for all active DEV projects.
+# Refreshes after a successful DEV deployment, nightly at 03:00 Asia/Kolkata, or on demand.
+# The nightly run pulls fresh Audit Core data for all active DEV projects.
 #
 # Active DEV tenants (from audit-core-live-baseline, 2026-09-30):
 #   MahindraOrissa  5fbe26ab-6ed7-444a-8488-5bfb81208588  (primary — has DI documents)
@@ -13,6 +13,8 @@ on:
     workflows: ["Deploy Analytics DEV"]
     types: [completed]
     branches: [main]
+  schedule:
+    - cron: '30 21 * * *' # 03:00 Asia/Kolkata
   workflow_dispatch:
     inputs:
       tenant_ids:
@@ -30,7 +32,7 @@ concurrency:
 
 jobs:
   dump:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -67,7 +69,7 @@ jobs:
         id: tenants
         run: |
           set -euo pipefail
-          INPUT="${{ inputs.tenant_ids }}"
+          INPUT="${{ inputs.tenant_ids || '' }}"
           RESOLVED="${INPUT:-$DEFAULT_TENANT_IDS}"
           # Normalise: trim spaces, remove empty entries
           CLEANED="$(echo "$RESOLVED" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | tr '\n' ',')"
