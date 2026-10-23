@@ -12,13 +12,13 @@ on:
   workflow_run:
     workflows: ["Deploy Analytics DEV"]
     types: [completed]
-    branches: [main]
+    branches: [main, analytics]
   schedule:
     - cron: '30 21 * * *' # 03:00 Asia/Kolkata
   workflow_dispatch:
     inputs:
       tenant_ids:
-        description: "Comma-separated tenant IDs to dump (leave blank for all three active DEV projects)"
+        description: "Comma-separated tenant IDs to dump (leave blank for included active DEV projects)"
         required: false
         type: string
         default: ""
@@ -45,6 +45,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -178,3 +180,10 @@ jobs:
 
           print('ANALYTICS_DUMP_VERIFY=PASS')
           PY
+
+      - name: Verify business reports against the refreshed project snapshots
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" \
+            python scripts/verify_business_reports.py \
+              --tenant-ids "${{ steps.tenants.outputs.tenant_list }}"

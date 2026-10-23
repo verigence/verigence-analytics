@@ -2,9 +2,9 @@ name: Analytics CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, analytics]
   push:
-    branches: [main]
+    branches: [main, analytics]
   workflow_dispatch:
 
 permissions:
@@ -23,9 +23,9 @@ jobs:
       - name: Install
         run: python -m pip install -e '.[test,lint]'
       - name: Compile
-        run: python -m compileall -q src tests migrations scripts/prepare_analytics_deploy.py
+        run: python -m compileall -q src tests migrations scripts/prepare_analytics_deploy.py scripts/verify_business_reports.py
       - name: Ruff
-        run: ruff check src tests migrations scripts/prepare_analytics_deploy.py
+        run: ruff check src tests migrations scripts/prepare_analytics_deploy.py scripts/verify_business_reports.py
       - name: Tests
         run: pytest -q
       - name: Alembic single head
@@ -63,6 +63,13 @@ jobs:
               '/v1/analytics/tenants/{tenant_id}/business-intelligence/trade-in-health',
               '/v1/analytics/tenants/{tenant_id}/business-intelligence/insurance-source',
               '/v1/analytics/tenants/{tenant_id}/business-intelligence/dealer-discount-grid',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/sales-product',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/discounts',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/insurance',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/vas',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/finance',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/payments',
+              '/v1/analytics/tenants/{tenant_id}/business-intelligence/geography',
           }
           missing=required-paths
           if missing: raise SystemExit('Missing routes: '+','.join(sorted(missing)))
