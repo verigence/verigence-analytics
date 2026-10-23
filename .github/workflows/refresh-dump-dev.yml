@@ -1,7 +1,7 @@
 name: Refresh Analytics Dump DEV
 
 # Refreshes after a successful DEV deployment, nightly at 03:00 Asia/Kolkata, or on demand.
-# The nightly run pulls fresh Audit Core data for all active DEV projects.
+# The nightly run pulls fresh Audit Core data for included DEV tenants.
 #
 # Analytics DEV tenant scope:
 #   Mahindra Orissa afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
