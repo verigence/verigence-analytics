@@ -65,15 +65,15 @@ def _print_data_diagnostics(
         term_values = connection.execute(
             text(
                 """
-                SELECT field.key, value.value, count(*)::int AS row_count
+                SELECT field.key, field.value, count(*)::int AS row_count
                 FROM analytics.snapshot_rows snapshot
                 CROSS JOIN LATERAL jsonb_each_text(snapshot.row_data) AS field(key, value)
                 WHERE snapshot.tenant_id=:tenant_id AND snapshot.dump_id=:dump_id
                   AND snapshot.source_table='journey_addons'
                   AND field.key ~* '(warranty|term|duration|period|year)'
-                  AND NULLIF(trim(value.value), '') IS NOT NULL
-                GROUP BY field.key, value.value
-                ORDER BY field.key, row_count DESC, value.value
+                  AND NULLIF(trim(field.value), '') IS NOT NULL
+                GROUP BY field.key, field.value
+                ORDER BY field.key, row_count DESC, field.value
                 LIMIT 80
                 """
             ),
