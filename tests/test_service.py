@@ -129,8 +129,9 @@ def test_delivery_invoice_projection_is_tax_invoice_only_and_private_safe() -> N
             return EmptyMappings()
 
     class RecordingSource:
-        statement = ""
-        params: dict[str, str] = {}
+        def __init__(self) -> None:
+            self.statement = ""
+            self.params: dict[str, str] = {}
 
         def execute(self, statement, params):
             self.statement = str(statement)
