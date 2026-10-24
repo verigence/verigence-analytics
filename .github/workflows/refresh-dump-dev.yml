@@ -12,7 +12,7 @@ on:
   workflow_run:
     workflows: ["Deploy Analytics DEV"]
     types: [completed]
-    branches: [analytics]
+    branches: [main]
   schedule:
     - cron: '30 21 * * *' # 03:00 Asia/Kolkata
   push:
@@ -95,7 +95,7 @@ jobs:
           echo "Tenants to dump: $CLEANED"
 
       - name: Dump Mahindra Orissa (afa9e32b)
-        if: github.event_name != 'push' && contains(steps.tenants.outputs.tenant_list, 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572')
+        if: contains(steps.tenants.outputs.tenant_list, 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572')
         run: |
           set -euo pipefail
           echo "::group::Dumping Mahindra Orissa"
@@ -106,7 +106,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Dump Hyundai Orissa (4c4bef2a)
-        if: github.event_name != 'push' && contains(steps.tenants.outputs.tenant_list, '4c4bef2a-1d01-498f-98b4-e4f9311282fb')
+        if: contains(steps.tenants.outputs.tenant_list, '4c4bef2a-1d01-498f-98b4-e4f9311282fb')
         run: |
           set -euo pipefail
           echo "::group::Dumping Hyundai Orissa"
@@ -143,6 +143,7 @@ jobs:
                          table_counts->>'dealer_discount_grid_rows'     AS grid_rows,
                          table_counts->>'p2_management_referrals'       AS mr_referrals,
                          table_counts->>'derived_accessory_line_items'   AS accessory_lines,
+                         table_counts->>'derived_delivery_invoice_line_items' AS delivery_invoice_lines,
                          table_counts->>'journeys'                      AS journeys,
                          table_counts->>'discount_applications'         AS discounts
                   FROM analytics.dump_runs
@@ -174,6 +175,7 @@ jobs:
                       f"|grid_rows={r['grid_rows']}"
                       f"|mr_referrals={r['mr_referrals']}"
                       f"|accessory_lines={r['accessory_lines']}"
+                       f"|delivery_invoice_lines={r['delivery_invoice_lines']}"
                   )
 
               missing = {
