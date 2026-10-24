@@ -427,7 +427,13 @@ def verify_tenant(tenant_id: str) -> None:
     assert int(reconciliation_coverage.get("delivered_journeys_with_tax_invoice_lines") or 0) <= int(
         reconciliation_coverage.get("delivered_journeys") or 0
     )
+    assert int(reconciliation_coverage.get("classified_unverified_vas_lines") or 0) <= int(
+        reconciliation_coverage.get("unverified_invoice_lines") or 0
+    )
     for row in reconciliation["by_category"]:
+        assert int(row["proposal_with_unverified_invoice_evidence_journeys"]) <= int(
+            row["unverified_invoice_evidence_journeys"]
+        )
         assert int(row["proposed_and_invoiced_journeys"]) <= int(
             row["delivered_proposal_journeys"]
         )

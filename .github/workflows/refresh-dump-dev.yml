@@ -144,6 +144,7 @@ jobs:
                          table_counts->>'p2_management_referrals'       AS mr_referrals,
                          table_counts->>'derived_accessory_line_items'   AS accessory_lines,
                          table_counts->>'derived_delivery_invoice_line_items' AS delivery_invoice_lines,
+                         table_counts->>'derived_unverified_delivery_invoice_line_items' AS unverified_delivery_invoice_lines,
                          table_counts->>'journeys'                      AS journeys,
                          table_counts->>'discount_applications'         AS discounts
                   FROM analytics.dump_runs
@@ -176,6 +177,7 @@ jobs:
                       f"|mr_referrals={r['mr_referrals']}"
                       f"|accessory_lines={r['accessory_lines']}"
                        f"|delivery_invoice_lines={r['delivery_invoice_lines']}"
+                      f"|unverified_delivery_invoice_lines={r['unverified_delivery_invoice_lines']}"
                   )
 
               missing = {
