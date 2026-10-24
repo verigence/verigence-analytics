@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import Connection
+from sqlalchemy import Connection, text
 
 from analytics.db import analytics_engine
 from analytics.pricing_audit import pricing_integrity_report
@@ -2699,9 +2699,15 @@ def customer_geography(
             _DEAL_FACTS_CTE
             + """
             SELECT customer_pincode,
+                   pin.district_name,
+                   pin.locality_names,
+                   dealer_id,
                    dealer_name,
+                   outlet_id,
                    outlet_name,
                    COALESCE(model_name,'Unresolved') AS model_name,
+                   booking_date::text AS booking_date,
+                   actual_delivered_at::date::text AS delivery_date,
                    count(*)::int AS journey_count,
                    count(*) FILTER (WHERE actual_delivered_at IS NOT NULL)::int
                        AS actual_deliveries,
@@ -2712,11 +2718,34 @@ def customer_geography(
                        WHERE actual_discount_present
                    ),2) AS avg_discount
             FROM deal_facts
+            LEFT JOIN analytics.geo_pin_master pin ON pin.pincode=deal_facts.customer_pincode
             WHERE customer_pincode IS NOT NULL AND has_booking
-            GROUP BY customer_pincode, dealer_name, outlet_name, model_name
-            ORDER BY journey_count DESC, customer_pincode, dealer_name, outlet_name, model_name
+            GROUP BY customer_pincode, pin.district_name, pin.locality_names,
+                     dealer_id, dealer_name, outlet_id, outlet_name, model_name,
+                     booking_date, actual_delivered_at::date
+            ORDER BY journey_count DESC, customer_pincode, dealer_name, outlet_name, model_name,
+                     booking_date, delivery_date
             """,
         )
+        outlet_locations = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            SELECT outlet_id, dealer_id, dealer_name, outlet_name, outlet_code,
+                   pincode, latitude, longitude, location_precision
+            FROM analytics.outlet_location_master
+            WHERE tenant_id=:tenant_id
+            ORDER BY dealer_name, outlet_name
+            """,
+        )
+        map_boundaries = [dict(row) for row in connection.execute(text("""
+            SELECT boundary_key, boundary_type, encode(content_gzip,'base64') AS content_gzip_base64,
+                   source_name, source_url
+            FROM analytics.geo_boundary_master
+            WHERE state_name='Odisha'
+            ORDER BY boundary_type
+        """)).mappings().all()]
     finally:
         connection.close()
 
@@ -2736,6 +2765,8 @@ def customer_geography(
         },
         "available": with_pin > 0,
         "rows": rows,
+        "outlet_locations": outlet_locations,
+        "map_boundaries": map_boundaries,
         "privacy": (
             "Analytics stores only the derived PIN and provenance for this use case, not the full "
             "customer address."
