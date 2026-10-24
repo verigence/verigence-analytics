@@ -186,9 +186,15 @@ jobs:
           print('ANALYTICS_DUMP_VERIFY=PASS')
           PY
 
+      - name: Checkout report verifier from main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: report-verifier
+
       - name: Verify business reports against the refreshed project snapshots
         run: |
           set -euo pipefail
           env -u RAILWAY_TOKEN railway run --service "$ANALYTICS_SERVICE" \
-            python scripts/verify_business_reports.py \
+            python report-verifier/scripts/verify_business_reports.py \
               --tenant-ids "${{ steps.tenants.outputs.tenant_list }}"
