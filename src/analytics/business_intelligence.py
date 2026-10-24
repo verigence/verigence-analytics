@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 41800)
-Total output lines: 3526
-
 from __future__ import annotations
 
 from typing import Annotated
@@ -1683,7 +1680,166 @@ def insurance_intelligence(
             "but does not persist a typed dealer-versus-customer route. Dealer-arranged versus "
             "customer/self-arranged is counted only when a legacy explicit route label exists or the "
             "self-insurance flag is true; a false or blank flag is not treated as proof of dealer "
-            "arrangement.…1800 tokens truncated…        a.row_data->>'reference_number'
+            "arrangement. Unknown route counts remain visible. Policy components and insurer premium "
+            "are broken out by dealership and outlet; they are captured premium values, not dealership "
+            "revenue."
+        ),
+    }
+
+
+
+
+@router.get("/vas")
+def vas_intelligence(
+    tenant_id: str,
+    _: Annotated[Principal, Depends(require_analytics_read)],
+) -> dict:
+    connection, latest = _latest_context(tenant_id)
+    try:
+        total_row = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                """
+                SELECT count(DISTINCT row_data->>'journey_id')::int AS journeys
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='bookings'
+                """,
+            )
+        )
+        total_journeys = int(total_row.get("journeys") or 0)
+        by_type = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            SELECT upper(COALESCE(a.row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
+                   count(*)::int AS record_count,
+                   count(DISTINCT a.row_data->>'journey_id')::int AS journey_count,
+                   COALESCE(sum(NULLIF(a.row_data->>'actual_amount','')::numeric),0)
+                       AS actual_amount,
+                   round(avg(NULLIF(a.row_data->>'actual_amount','')::numeric),2)
+                       AS avg_record_amount
+            FROM analytics.snapshot_rows a
+            WHERE a.tenant_id=:tenant_id AND a.dump_id=:dump_id AND a.source_table='journey_addons'
+              AND EXISTS (
+                  SELECT 1 FROM analytics.snapshot_rows b
+                  WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                    AND b.source_table='bookings'
+                    AND b.row_data->>'journey_id'=a.row_data->>'journey_id'
+              )
+            GROUP BY 1
+            ORDER BY journey_count DESC, addon_type
+            """,
+        )
+        by_type = _with_penetration(
+            by_type,
+            denominator=total_journeys,
+            count_key="journey_count",
+        )
+        by_outlet = _rows(
+            connection,
+            latest,
+            tenant_id,
+            """
+            WITH journeys AS (
+                SELECT row_data->>'journey_id' AS journey_id,
+                       row_data->>'dealer_id' AS dealer_id,
+                       row_data->>'outlet_id' AS outlet_id
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='journeys'
+            ),
+            dealers AS (
+                SELECT row_data->>'dealer_id' AS dealer_id,
+                       COALESCE(row_data->>'dealer_name','Unspecified dealer') AS dealer_name
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id AND source_table='dealers'
+            ),
+            outlets AS (
+                SELECT row_data->>'outlet_id' AS outlet_id,
+                       COALESCE(row_data->>'outlet_name','Unspecified outlet') AS outlet_name
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                  AND source_table='dealer_outlets'
+            ),
+            addon_rows AS (
+                SELECT a.row_data->>'journey_id' AS journey_id,
+                       upper(COALESCE(a.row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
+                       NULLIF(a.row_data->>'actual_amount','')::numeric AS actual_amount
+                FROM analytics.snapshot_rows a
+                WHERE a.tenant_id=:tenant_id AND a.dump_id=:dump_id
+                  AND a.source_table='journey_addons'
+                  AND EXISTS (
+                      SELECT 1 FROM analytics.snapshot_rows b
+                      WHERE b.tenant_id=:tenant_id AND b.dump_id=:dump_id
+                        AND b.source_table='bookings'
+                        AND b.row_data->>'journey_id'=a.row_data->>'journey_id'
+                  )
+            )
+            SELECT d.dealer_name, o.outlet_name, a.addon_type,
+                   count(DISTINCT a.journey_id)::int AS journey_count,
+                   COALESCE(sum(a.actual_amount),0) AS actual_amount
+            FROM addon_rows a
+            JOIN journeys j USING (journey_id)
+            LEFT JOIN dealers d ON d.dealer_id=j.dealer_id
+            LEFT JOIN outlets o ON o.outlet_id=j.outlet_id
+            GROUP BY d.dealer_name, o.outlet_name, a.addon_type
+            ORDER BY journey_count DESC, d.dealer_name, o.outlet_name, a.addon_type
+            """,
+        )
+        by_product_type = _rows(
+            connection,
+            latest,
+            tenant_id,
+            _DEAL_FACTS_CTE
+            + """
+            SELECT df.dealer_id,
+                   df.dealer_name,
+                   df.outlet_id,
+                   df.outlet_name,
+                   COALESCE(df.model_name,'Unresolved') AS model_name,
+                   COALESCE(df.variant_name,'Unresolved') AS variant_name,
+                   upper(COALESCE(a.row_data->>'addon_type_code','UNSPECIFIED')) AS addon_type,
+                   count(*)::int AS record_count,
+                   count(DISTINCT df.journey_id)::int AS journey_count,
+                   count(*) FILTER (
+                       WHERE NULLIF(a.row_data->>'actual_amount','') IS NOT NULL
+                   )::int AS priced_records,
+                   COALESCE(sum(NULLIF(a.row_data->>'actual_amount','')::numeric),0)
+                       AS actual_amount,
+                   round(avg(NULLIF(a.row_data->>'actual_amount','')::numeric),2)
+                       AS avg_record_amount
+            FROM deal_facts df
+            JOIN analytics.snapshot_rows a
+              ON a.tenant_id=:tenant_id
+             AND a.dump_id=:dump_id
+             AND a.source_table='journey_addons'
+             AND a.row_data->>'journey_id'=df.journey_id
+            WHERE df.has_booking
+            GROUP BY df.dealer_id, df.dealer_name, df.outlet_id, df.outlet_name,
+                     df.model_name, df.variant_name, addon_type
+            ORDER BY actual_amount DESC, journey_count DESC,
+                     df.dealer_name, df.outlet_name, model_name, variant_name, addon_type
+            """,
+        )
+        warranty_rsa_cte = _DEAL_FACTS_CTE + """
+        , warranty_rsa_source_rows AS (
+            SELECT df.dealer_id,
+                   df.dealer_name,
+                   df.outlet_id,
+                   df.outlet_name,
+                   COALESCE(NULLIF(df.model_name,''),'Unresolved') AS model_name,
+                   COALESCE(NULLIF(df.variant_name,''),'Unresolved') AS variant_name,
+                   df.journey_id,
+                   'journey_addons'::text AS source_kind,
+                   a.source_pk AS source_record_id,
+                   upper(COALESCE(a.row_data->>'addon_type_code','')) AS addon_type_code,
+                   concat_ws(' ',
+                       a.row_data->>'addon_type_code',
+                       a.row_data->>'details',
+                       a.row_data->>'provider_name',
+                       a.row_data->>'reference_number'
                    ) AS evidence_text
             FROM deal_facts df
             JOIN analytics.snapshot_rows a
