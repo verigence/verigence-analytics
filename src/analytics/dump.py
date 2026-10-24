@@ -5,10 +5,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, text
-
 from analytics.config import load_settings
 from analytics.db import analytics_engine, source_engine
+from sqlalchemy import Connection, text
 
 
 @dataclass(frozen=True)
@@ -62,6 +61,9 @@ SOURCE_TABLES: tuple[SourceTable, ...] = (
 _DERIVED_GEOGRAPHY_TABLE = "derived_customer_geography"
 _DERIVED_ACCESSORY_LINE_ITEMS_TABLE = "derived_accessory_line_items"
 _DERIVED_DELIVERY_INVOICE_LINE_ITEMS_TABLE = "derived_delivery_invoice_line_items"
+_DERIVED_UNVERIFIED_DELIVERY_INVOICE_LINE_ITEMS_TABLE = (
+    "derived_unverified_delivery_invoice_line_items"
+)
 
 
 def _identifier(value: str) -> str:
@@ -281,6 +283,28 @@ def _copy_derived_delivery_invoice_line_items(
     )
 
 
+def _copy_derived_unverified_delivery_invoice_line_items(
+    source: Connection,
+    target: Connection,
+    *,
+    source_schema: str,
+    tenant_id: str,
+    dump_id: UUID,
+    batch_size: int,
+) -> int:
+    return _copy_derived_invoice_line_items(
+        source,
+        target,
+        source_schema=source_schema,
+        tenant_id=tenant_id,
+        dump_id=dump_id,
+        batch_size=batch_size,
+        target_table=_DERIVED_UNVERIFIED_DELIVERY_INVOICE_LINE_ITEMS_TABLE,
+        invoice_purpose=None,
+        invoice_nature="UNKNOWN",
+    )
+
+
 def _copy_derived_invoice_line_items(
     source: Connection,
     target: Connection,
@@ -299,7 +323,9 @@ def _copy_derived_invoice_line_items(
     This projection deliberately selects only the journey link, commercial line fields,
     document purpose/classification and redacted invoice source. It never serializes the
     source row or the complete ``line_items`` JSON. The fixed filters are supplied only
-    by the accessory and confirmed delivery-invoice wrappers above.
+    by the accessory, confirmed delivery-invoice, and unverified delivery-invoice
+    wrappers above. Unknown-nature documents are held in a separate projection so
+    they can prompt review without being counted as confirmed purchases.
     """
     if (invoice_purpose is None) == (invoice_nature is None):
         raise ValueError("Exactly one invoice projection filter is required")
@@ -581,6 +607,21 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                         delivery_invoice_line_count
                     )
                     total += delivery_invoice_line_count
+
+                    unverified_delivery_invoice_line_count = (
+                        _copy_derived_unverified_delivery_invoice_line_items(
+                            source,
+                            target,
+                            source_schema=settings.source_schema,
+                            tenant_id=tenant_id,
+                            dump_id=dump_id,
+                            batch_size=settings.dump_batch_size,
+                        )
+                    )
+                    counts[_DERIVED_UNVERIFIED_DELIVERY_INVOICE_LINE_ITEMS_TABLE] = (
+                        unverified_delivery_invoice_line_count
+                    )
+                    total += unverified_delivery_invoice_line_count
                 tx.commit()
             except Exception:
                 tx.rollback()

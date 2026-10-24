@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from analytics.db import analytics_engine
+from analytics.security import Principal, require_analytics_read
 from fastapi import APIRouter, Depends
 from sqlalchemy import Connection
 
-from analytics.db import analytics_engine
 from analytics.pricing_audit import pricing_integrity_report
 from analytics.reports import _latest_dump, _query_rows
-from analytics.security import Principal, require_analytics_read
 
 router = APIRouter(
     prefix="/v1/analytics/tenants/{tenant_id}/business-intelligence",
@@ -2210,7 +2210,7 @@ def vas_intelligence(
             WHERE category IS NOT NULL
             GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
                      model_name, variant_name, journey_id, category
-        ), delivery_invoice_lines AS (
+        ), delivery_invoice_candidates AS (
             SELECT df.dealer_id,
                    df.dealer_name,
                    df.outlet_id,
@@ -2220,6 +2220,7 @@ def vas_intelligence(
                    df.journey_id,
                    split_part(a.source_pk,':',1) AS invoice_document_id,
                    a.source_pk AS invoice_line_id,
+                   upper(COALESCE(a.row_data->>'invoice_nature','')) AS invoice_nature,
                    upper(COALESCE(a.row_data->>'invoice_purpose','')) AS invoice_purpose,
                    CASE
                        WHEN concat_ws(' ',
@@ -2250,11 +2251,21 @@ def vas_intelligence(
             JOIN analytics.snapshot_rows a
               ON a.tenant_id=:tenant_id
              AND a.dump_id=:dump_id
-             AND a.source_table='derived_delivery_invoice_line_items'
+             AND a.source_table IN (
+                 'derived_delivery_invoice_line_items',
+                 'derived_unverified_delivery_invoice_line_items'
+             )
              AND a.row_data->>'journey_id'=df.journey_id
             WHERE df.has_booking
               AND df.actual_delivered_at IS NOT NULL
-              AND upper(COALESCE(a.row_data->>'invoice_nature',''))='TAX_INVOICE'
+        ), delivery_invoice_lines AS (
+            SELECT *
+            FROM delivery_invoice_candidates
+            WHERE invoice_nature='TAX_INVOICE'
+        ), unverified_delivery_invoice_lines AS (
+            SELECT *
+            FROM delivery_invoice_candidates
+            WHERE invoice_nature='UNKNOWN'
         ), invoice_coverage_by_journey AS (
             SELECT journey_id,
                    count(DISTINCT invoice_document_id)::int AS invoice_document_count
@@ -2268,6 +2279,17 @@ def vas_intelligence(
                    string_agg(DISTINCT NULLIF(invoice_purpose,''), ', '
                        ORDER BY NULLIF(invoice_purpose,'')) AS invoice_purposes
             FROM delivery_invoice_lines
+            WHERE category IS NOT NULL
+            GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
+                     model_name, variant_name, journey_id, category
+        ), unverified_invoice_purchase_by_journey AS (
+            SELECT dealer_id, dealer_name, outlet_id, outlet_name,
+                   model_name, variant_name, journey_id, category,
+                   count(DISTINCT invoice_line_id)::int AS invoice_line_count,
+                   count(DISTINCT invoice_document_id)::int AS invoice_document_count,
+                   string_agg(DISTINCT NULLIF(invoice_purpose,''), ', '
+                       ORDER BY NULLIF(invoice_purpose,'')) AS invoice_purposes
+            FROM unverified_delivery_invoice_lines
             WHERE category IS NOT NULL
             GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
                      model_name, variant_name, journey_id, category
@@ -2285,14 +2307,21 @@ def vas_intelligence(
                    COALESCE(i.invoice_line_count,0) AS invoice_line_count,
                    COALESCE(i.invoice_document_count,0) AS invoice_document_count,
                    i.invoice_purposes,
+                   COALESCE(u.invoice_line_count,0) AS unverified_invoice_line_count,
+                   COALESCE(u.invoice_document_count,0) AS unverified_invoice_document_count,
+                   u.invoice_purposes AS unverified_invoice_purposes,
                    COALESCE(ic.invoice_document_count,0)>0 AS has_invoice_evidence,
-                   COALESCE(i.invoice_line_count,0)>0 AS invoice_purchase_observed
+                   COALESCE(i.invoice_line_count,0)>0 AS invoice_purchase_observed,
+                   COALESCE(u.invoice_line_count,0)>0
+                     AND COALESCE(i.invoice_line_count,0)=0 AS unverified_invoice_observed
             FROM deal_facts df
             CROSS JOIN vas_categories c
             LEFT JOIN proposal_by_journey p
               ON p.journey_id=df.journey_id AND p.category=c.category
             LEFT JOIN invoice_purchase_by_journey i
               ON i.journey_id=df.journey_id AND i.category=c.category
+            LEFT JOIN unverified_invoice_purchase_by_journey u
+              ON u.journey_id=df.journey_id AND u.category=c.category
             LEFT JOIN invoice_coverage_by_journey ic
               ON ic.journey_id=df.journey_id
             WHERE df.has_booking
@@ -2320,12 +2349,20 @@ def vas_intelligence(
                        WHERE r.proposal_record_count>0 AND r.invoice_purchase_observed
                    )::int AS proposed_and_invoiced_journeys,
                    count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.unverified_invoice_observed
+                   )::int AS unverified_invoice_evidence_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.proposal_record_count>0 AND r.unverified_invoice_observed
+                   )::int AS proposal_with_unverified_invoice_evidence_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
                        WHERE r.proposal_record_count>0 AND r.has_invoice_evidence
                          AND NOT r.invoice_purchase_observed
+                         AND NOT r.unverified_invoice_observed
                    )::int AS proposal_not_observed_on_invoice_journeys,
                    count(DISTINCT r.journey_id) FILTER (
                        WHERE r.proposal_record_count>0 AND r.actual_delivered_at IS NOT NULL
                          AND NOT r.has_invoice_evidence
+                         AND NOT r.unverified_invoice_observed
                    )::int AS proposal_without_invoice_evidence_journeys,
                    count(DISTINCT r.journey_id) FILTER (
                        WHERE r.invoice_purchase_observed AND r.proposal_record_count=0
@@ -2339,6 +2376,7 @@ def vas_intelligence(
                            WHERE r.proposal_record_count>0 AND r.invoice_purchase_observed
                        ) / NULLIF(count(DISTINCT r.journey_id) FILTER (
                            WHERE r.proposal_record_count>0 AND r.has_invoice_evidence
+                             AND NOT r.unverified_invoice_observed
                        ),0),
                        1
                    ) AS proposal_invoice_match_pct
@@ -2374,12 +2412,20 @@ def vas_intelligence(
                        WHERE proposal_record_count>0 AND invoice_purchase_observed
                    )::int AS proposed_and_invoiced_journeys,
                    count(*) FILTER (
+                       WHERE unverified_invoice_observed
+                   )::int AS unverified_invoice_evidence_journeys,
+                   count(*) FILTER (
+                       WHERE proposal_record_count>0 AND unverified_invoice_observed
+                   )::int AS proposal_with_unverified_invoice_evidence_journeys,
+                   count(*) FILTER (
                        WHERE proposal_record_count>0 AND has_invoice_evidence
                          AND NOT invoice_purchase_observed
+                         AND NOT unverified_invoice_observed
                    )::int AS proposal_not_observed_on_invoice_journeys,
                    count(*) FILTER (
                        WHERE proposal_record_count>0 AND actual_delivered_at IS NOT NULL
                          AND NOT has_invoice_evidence
+                         AND NOT unverified_invoice_observed
                    )::int AS proposal_without_invoice_evidence_journeys,
                    count(*) FILTER (
                        WHERE invoice_purchase_observed AND proposal_record_count=0
@@ -2387,12 +2433,18 @@ def vas_intelligence(
                    string_agg(DISTINCT invoice_purposes, '; '
                        ORDER BY invoice_purposes) FILTER (
                        WHERE invoice_purchase_observed AND invoice_purposes IS NOT NULL
-                   ) AS invoice_purposes
+                   ) AS invoice_purposes,
+                   string_agg(DISTINCT unverified_invoice_purposes, '; '
+                       ORDER BY unverified_invoice_purposes) FILTER (
+                       WHERE unverified_invoice_observed
+                         AND unverified_invoice_purposes IS NOT NULL
+                   ) AS unverified_invoice_purposes
             FROM booked_journey_categories
             GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
                      model_name, variant_name, category
             HAVING count(*) FILTER (WHERE proposal_record_count>0)>0
                 OR count(*) FILTER (WHERE invoice_purchase_observed)>0
+                OR count(*) FILTER (WHERE unverified_invoice_observed)>0
             ORDER BY dealer_name, outlet_name, model_name, variant_name, category
             """,
         )
@@ -2415,6 +2467,19 @@ def vas_intelligence(
                            AS delivery_tax_invoice_lines,
                        (SELECT count(*)::int FROM delivery_invoice_lines
                         WHERE category IS NULL) AS unclassified_tax_invoice_lines,
+                       count(DISTINCT journey_id) FILTER (
+                           WHERE actual_delivered_at IS NOT NULL
+                             AND unverified_invoice_observed
+                       )::int AS delivered_journeys_with_unverified_vas_evidence,
+                       (SELECT count(DISTINCT invoice_document_id)::int
+                        FROM unverified_delivery_invoice_lines)
+                           AS unverified_invoice_documents,
+                       (SELECT count(*)::int FROM unverified_delivery_invoice_lines)
+                           AS unverified_invoice_lines,
+                       (SELECT count(*)::int FROM unverified_delivery_invoice_lines
+                        WHERE category IS NOT NULL) AS classified_unverified_vas_lines,
+                       (SELECT count(*)::int FROM unverified_delivery_invoice_lines
+                        WHERE category IS NULL) AS unclassified_unverified_invoice_lines,
                        round(100.0 * count(DISTINCT journey_id) FILTER (
                            WHERE actual_delivered_at IS NOT NULL AND has_invoice_evidence
                        ) / NULLIF(count(DISTINCT journey_id) FILTER (
@@ -2449,11 +2514,13 @@ def vas_intelligence(
             "definition": (
                 "A booking proposal is a captured journey_addons category record linked to a booked "
                 "journey; Audit Core currently does not provide a separate proposal/acceptance state. "
-                "Invoice purchases are classified from redacted line descriptions, item codes and "
-                "categories on confirmed TAX_INVOICE records linked to completed deliveries. A proposal "
-                "without a matching line is called not observed only when tax-invoice lines exist for "
-                "that delivered journey. Missing invoice evidence and unclassified lines remain unknown, "
-                "not zero or not purchased."
+                "Confirmed invoice purchases are classified from redacted line descriptions, item codes "
+                "and categories on TAX_INVOICE records linked to completed deliveries. A matching VAS "
+                "line on a document whose invoice nature is UNKNOWN is surfaced as unverified evidence, "
+                "not counted as bought and not treated as a missing sale. A proposal without a matching "
+                "line is called not observed only when confirmed tax-invoice lines exist for that delivered "
+                "journey and no unverified category match exists. Missing invoice evidence and "
+                "unclassified lines remain unknown, not zero or not purchased."
             ),
         },
         "accessory_codes": ["ACCESSORY", "ACCESSORIES", "ACCESSORIES_TOTAL"],

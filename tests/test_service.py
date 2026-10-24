@@ -11,15 +11,17 @@ os.environ.setdefault("SECURITY_TOKEN_ISSUER", "verigence-security")
 os.environ.setdefault("SECURITY_TOKEN_AUDIENCE", "verigence-platform")
 os.environ.setdefault("ANALYTICS_SECRET_KEY", "test-only-secret")
 
+from analytics.main import create_app
+from analytics.security_authorization import SecurityAuthorizationClient
+
 from analytics import reports
 from analytics.dump import (
     SOURCE_TABLES,
     _copy_derived_accessory_line_items,
     _copy_derived_delivery_invoice_line_items,
+    _copy_derived_unverified_delivery_invoice_line_items,
     _identifier,
 )
-from analytics.main import create_app
-from analytics.security_authorization import SecurityAuthorizationClient
 
 
 def test_health_route_is_registered() -> None:
@@ -158,6 +160,46 @@ def test_delivery_invoice_projection_is_tax_invoice_only_and_private_safe() -> N
     assert "buyer_address" not in sql
     assert "vin_number" not in sql
     assert source.params == {"tenant_id": "tenant", "invoice_nature": "TAX_INVOICE"}
+
+
+def test_unverified_delivery_invoice_projection_is_separate_and_private_safe() -> None:
+    class EmptyMappings:
+        def fetchmany(self, _size: int) -> list[dict]:
+            return []
+
+    class EmptyResult:
+        def mappings(self) -> EmptyMappings:
+            return EmptyMappings()
+
+    class RecordingSource:
+        def __init__(self) -> None:
+            self.statement = ""
+            self.params: dict[str, str] = {}
+
+        def execute(self, statement, params):
+            self.statement = str(statement)
+            self.params = params
+            return EmptyResult()
+
+    source = RecordingSource()
+    _copy_derived_unverified_delivery_invoice_line_items(
+        source,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        source_schema="auditcore",
+        tenant_id="tenant",
+        dump_id=uuid4(),
+        batch_size=10,
+    )
+
+    sql = source.statement.lower()
+    assert "upper(trim(coalesce(invoice_nature, ''))) = :invoice_nature" in sql
+    assert "journey_id is not null" in sql
+    assert "safe_description" in sql
+    assert "to_jsonb(t)" not in sql
+    assert "buyer_name" not in sql
+    assert "buyer_address" not in sql
+    assert "vin_number" not in sql
+    assert source.params == {"tenant_id": "tenant", "invoice_nature": "UNKNOWN"}
 
 
 def test_identifier_guard() -> None:
