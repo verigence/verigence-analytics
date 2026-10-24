@@ -11,9 +11,6 @@ os.environ.setdefault("SECURITY_TOKEN_ISSUER", "verigence-security")
 os.environ.setdefault("SECURITY_TOKEN_AUDIENCE", "verigence-platform")
 os.environ.setdefault("ANALYTICS_SECRET_KEY", "test-only-secret")
 
-from analytics.main import create_app
-from analytics.security_authorization import SecurityAuthorizationClient
-
 from analytics import reports
 from analytics.dump import (
     SOURCE_TABLES,
@@ -22,6 +19,8 @@ from analytics.dump import (
     _copy_derived_unverified_delivery_invoice_line_items,
     _identifier,
 )
+from analytics.main import create_app
+from analytics.security_authorization import SecurityAuthorizationClient
 
 
 def test_health_route_is_registered() -> None:

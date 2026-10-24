@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from analytics.db import analytics_engine
-from analytics.security import Principal, require_analytics_read
 from fastapi import APIRouter, Depends
 from sqlalchemy import Connection
 
+from analytics.db import analytics_engine
 from analytics.pricing_audit import pricing_integrity_report
 from analytics.reports import _latest_dump, _query_rows
+from analytics.security import Principal, require_analytics_read
 
 router = APIRouter(
     prefix="/v1/analytics/tenants/{tenant_id}/business-intelligence",

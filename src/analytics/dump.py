@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+from sqlalchemy import Connection, text
+
 from analytics.config import load_settings
 from analytics.db import analytics_engine, source_engine
-from sqlalchemy import Connection, text
 
 
 @dataclass(frozen=True)

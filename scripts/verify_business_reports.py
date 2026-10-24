@@ -7,8 +7,6 @@ import json
 import re
 from decimal import Decimal
 
-from analytics.config import load_settings
-from analytics.db import source_engine
 from sqlalchemy import text
 
 from analytics.business_intelligence import (
@@ -22,6 +20,8 @@ from analytics.business_intelligence import (
     sales_product,
     vas_intelligence,
 )
+from analytics.config import load_settings
+from analytics.db import source_engine
 from analytics.reports import productivity
 
 
