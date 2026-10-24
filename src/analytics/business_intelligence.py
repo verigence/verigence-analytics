@@ -2742,11 +2742,28 @@ def customer_geography(
             latest,
             tenant_id,
             """
-            SELECT outlet_id, dealer_id, dealer_name, outlet_name, outlet_code,
-                   pincode, latitude, longitude, location_precision
-            FROM analytics.outlet_location_master
-            WHERE tenant_id=:tenant_id
-            ORDER BY dealer_name, outlet_name
+            SELECT loc.outlet_id, loc.dealer_id, loc.dealer_name, loc.outlet_name, loc.outlet_code,
+                   COALESCE(
+                       NULLIF(BTRIM(loc.pincode), ''),
+                       NULLIF((regexp_match(
+                           COALESCE(outlet.row_data->>'address_text',''),
+                           '(^|[^0-9])([1-9][0-9]{5})([^0-9]|$)'
+                       ))[2], '')
+                   ) AS pincode,
+                   loc.latitude, loc.longitude,
+                   CASE
+                       WHEN loc.latitude IS NULL OR loc.longitude IS NULL
+                            THEN 'PIN_CENTROID'
+                       ELSE loc.location_precision
+                   END AS location_precision
+            FROM analytics.outlet_location_master loc
+            LEFT JOIN analytics.snapshot_rows outlet
+              ON outlet.tenant_id=loc.tenant_id
+             AND outlet.dump_id=:dump_id
+             AND outlet.source_table='dealer_outlets'
+             AND outlet.row_data->>'outlet_id'=loc.outlet_id
+            WHERE loc.tenant_id=:tenant_id
+            ORDER BY loc.dealer_name, loc.outlet_name
             """,
         )
         map_boundaries = [dict(row) for row in connection.execute(text("""
