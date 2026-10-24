@@ -9,8 +9,6 @@ from decimal import Decimal
 
 from sqlalchemy import text
 
-from analytics.config import load_settings
-from analytics.db import source_engine
 from analytics.business_intelligence import (
     _DEAL_FACTS_CTE,
     _latest_context,
@@ -22,6 +20,8 @@ from analytics.business_intelligence import (
     sales_product,
     vas_intelligence,
 )
+from analytics.config import load_settings
+from analytics.db import source_engine
 from analytics.reports import productivity
 
 
@@ -220,6 +220,19 @@ def _print_data_diagnostics(
         f"tenant={tenant_id}|"
         + json.dumps(vas.get("by_type", []), separators=(",", ":"), default=str)
     )
+    reconciliation = vas.get("booking_invoice_reconciliation", {})
+    print(
+        "BOOKING_INVOICE_VAS_RECONCILIATION|"
+        f"tenant={tenant_id}|"
+        + json.dumps(
+            {
+                "invoice_coverage": reconciliation.get("invoice_coverage", {}),
+                "by_category": reconciliation.get("by_category", []),
+            },
+            separators=(",", ":"),
+            default=str,
+        )
+    )
     policy_terms = [
         row for row in insurance.get("add_ons", [])
         if any(re.search(r"warrant|rsa|roadside|assistance", term, re.IGNORECASE)
@@ -272,9 +285,8 @@ def _print_delivery_invoice_diagnostics(tenant_id: str) -> None:
                            )::int AS documents_with_lines
                     FROM {source_schema}.invoice_review_values
                     WHERE tenant_id=:tenant_id
-                    GROUP BY invoice_purpose, document_type_key, invoice_nature
-                    ORDER BY invoice_documents DESC, invoice_purpose,
-                             document_type_key, invoice_nature
+                    GROUP BY 1, 2, 3
+                    ORDER BY invoice_documents DESC, 1, 2, 3
                     """
                 ),
                 params,
@@ -408,6 +420,20 @@ def verify_tenant(tenant_id: str) -> None:
         "dealer_name" in row and "outlet_name" in row
         for row in accessories["accessory_items"]
     )
+    reconciliation = accessories["booking_invoice_reconciliation"]
+    required_vas = {"EW", "INSURANCE", "RSA", "FASTAG", "ACCESSORIES"}
+    assert {row["category"] for row in reconciliation["by_category"]} == required_vas
+    reconciliation_coverage = reconciliation["invoice_coverage"]
+    assert int(reconciliation_coverage.get("delivered_journeys_with_tax_invoice_lines") or 0) <= int(
+        reconciliation_coverage.get("delivered_journeys") or 0
+    )
+    for row in reconciliation["by_category"]:
+        assert int(row["proposed_and_invoiced_journeys"]) <= int(
+            row["delivered_proposal_journeys"]
+        )
+        assert int(row["proposal_not_observed_on_invoice_journeys"]) <= int(
+            row["invoice_covered_delivered_journeys"]
+        )
 
     assert "by_lender_outlet" in finance and "by_outlet" in finance
     assert "by_channel" in payments and "by_outlet" in payments

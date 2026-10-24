@@ -61,6 +61,7 @@ SOURCE_TABLES: tuple[SourceTable, ...] = (
 
 _DERIVED_GEOGRAPHY_TABLE = "derived_customer_geography"
 _DERIVED_ACCESSORY_LINE_ITEMS_TABLE = "derived_accessory_line_items"
+_DERIVED_DELIVERY_INVOICE_LINE_ITEMS_TABLE = "derived_delivery_invoice_line_items"
 
 
 def _identifier(value: str) -> str:
@@ -245,22 +246,79 @@ def _copy_derived_accessory_line_items(
     dump_id: UUID,
     batch_size: int,
 ) -> int:
-    """Project accessory invoice lines without copying customer or vehicle PII.
+    return _copy_derived_invoice_line_items(
+        source,
+        target,
+        source_schema=source_schema,
+        tenant_id=tenant_id,
+        dump_id=dump_id,
+        batch_size=batch_size,
+        target_table=_DERIVED_ACCESSORY_LINE_ITEMS_TABLE,
+        invoice_purpose="ACCESSORY",
+        invoice_nature=None,
+    )
+
+
+def _copy_derived_delivery_invoice_line_items(
+    source: Connection,
+    target: Connection,
+    *,
+    source_schema: str,
+    tenant_id: str,
+    dump_id: UUID,
+    batch_size: int,
+) -> int:
+    return _copy_derived_invoice_line_items(
+        source,
+        target,
+        source_schema=source_schema,
+        tenant_id=tenant_id,
+        dump_id=dump_id,
+        batch_size=batch_size,
+        target_table=_DERIVED_DELIVERY_INVOICE_LINE_ITEMS_TABLE,
+        invoice_purpose=None,
+        invoice_nature="TAX_INVOICE",
+    )
+
+
+def _copy_derived_invoice_line_items(
+    source: Connection,
+    target: Connection,
+    *,
+    source_schema: str,
+    tenant_id: str,
+    dump_id: UUID,
+    batch_size: int,
+    target_table: str,
+    invoice_purpose: str | None,
+    invoice_nature: str | None,
+) -> int:
+    """Project invoice lines without copying customer or vehicle PII.
 
     ``invoice_review_values`` includes customer, tax, address and vehicle identifiers.
     This projection deliberately selects only the journey link, commercial line fields,
-    document classification and redacted invoice source. It never serializes the source
-    row or the complete ``line_items`` JSON.
+    document purpose/classification and redacted invoice source. It never serializes the
+    source row or the complete ``line_items`` JSON. The fixed filters are supplied only
+    by the accessory and confirmed delivery-invoice wrappers above.
     """
+    if (invoice_purpose is None) == (invoice_nature is None):
+        raise ValueError("Exactly one invoice projection filter is required")
     schema = _identifier(source_schema)
+    document_filter = (
+        "AND upper(trim(COALESCE(invoice_purpose, ''))) = :invoice_purpose"
+        if invoice_purpose is not None
+        else "AND upper(trim(COALESCE(invoice_nature, ''))) = :invoice_nature "
+        "AND journey_id IS NOT NULL"
+    )
     query = text(
         f"""
-        WITH accessory_documents AS (
+        WITH selected_documents AS (
             SELECT invoice_review_value_id,
                    journey_id,
                    source_system,
                    document_type_key,
                    invoice_nature,
+                   invoice_purpose,
                    invoice_number,
                    invoice_date,
                    grand_total_amount,
@@ -271,13 +329,14 @@ def _copy_derived_accessory_line_items(
                    line_items
             FROM {schema}.invoice_review_values
             WHERE tenant_id = :tenant_id
-              AND upper(trim(COALESCE(invoice_purpose, ''))) = 'ACCESSORY'
+              {document_filter}
         ), ranked_documents AS (
             SELECT d.invoice_review_value_id,
                    d.journey_id,
                    d.source_system,
                    d.document_type_key,
                    d.invoice_nature,
+                   d.invoice_purpose,
                    d.line_items,
                    count(*) OVER (
                        PARTITION BY d.journey_id,
@@ -325,13 +384,14 @@ def _copy_derived_accessory_line_items(
                        END,
                        d.invoice_review_value_id
                    ) AS source_rank
-            FROM accessory_documents d
+            FROM selected_documents d
         ), line_rows AS (
             SELECT d.invoice_review_value_id,
                    d.journey_id,
                    d.source_system,
                    d.document_type_key,
                    d.invoice_nature,
+                   d.invoice_purpose,
                    d.source_document_count,
                    item.ordinality AS line_number,
                    item.value AS line_item
@@ -370,6 +430,7 @@ def _copy_derived_accessory_line_items(
                    'source_system', NULLIF(trim(COALESCE(source_system, '')), ''),
                    'document_type_key', NULLIF(trim(COALESCE(document_type_key, '')), ''),
                    'invoice_nature', NULLIF(trim(COALESCE(invoice_nature, '')), ''),
+                   'invoice_purpose', NULLIF(trim(COALESCE(invoice_purpose, '')), ''),
                    'source_document_count', source_document_count,
                    'line_number', line_number,
                    'line_category', NULLIF(trim(COALESCE(line_item->>'line_category', '')), ''),
@@ -407,7 +468,12 @@ def _copy_derived_accessory_line_items(
         FROM normalized
         """
     )
-    result = source.execute(query, {"tenant_id": tenant_id}).mappings()
+    params = {"tenant_id": tenant_id}
+    if invoice_purpose is not None:
+        params["invoice_purpose"] = invoice_purpose
+    else:
+        params["invoice_nature"] = invoice_nature
+    result = source.execute(query, params).mappings()
     row_count = 0
     while True:
         batch = result.fetchmany(batch_size)
@@ -418,7 +484,7 @@ def _copy_derived_accessory_line_items(
             target,
             dump_id=dump_id,
             tenant_id=tenant_id,
-            table=_DERIVED_ACCESSORY_LINE_ITEMS_TABLE,
+            table=target_table,
             rows=dict_batch,
         )
         row_count += len(dict_batch)
@@ -502,6 +568,19 @@ def create_dump(*, tenant_id: str, requested_by: str = "manual") -> UUID:
                     )
                     counts[_DERIVED_ACCESSORY_LINE_ITEMS_TABLE] = accessory_line_count
                     total += accessory_line_count
+
+                    delivery_invoice_line_count = _copy_derived_delivery_invoice_line_items(
+                        source,
+                        target,
+                        source_schema=settings.source_schema,
+                        tenant_id=tenant_id,
+                        dump_id=dump_id,
+                        batch_size=settings.dump_batch_size,
+                    )
+                    counts[_DERIVED_DELIVERY_INVOICE_LINE_ITEMS_TABLE] = (
+                        delivery_invoice_line_count
+                    )
+                    total += delivery_invoice_line_count
                 tx.commit()
             except Exception:
                 tx.rollback()

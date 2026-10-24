@@ -1869,6 +1869,29 @@ def vas_intelligence(
              AND a.row_data->>'journey_id'=df.journey_id
             WHERE df.has_booking
               AND upper(COALESCE(a.row_data->>'invoice_nature',''))='TAX_INVOICE'
+            UNION ALL
+            SELECT df.dealer_id,
+                   df.dealer_name,
+                   df.outlet_id,
+                   df.outlet_name,
+                   COALESCE(NULLIF(df.model_name,''),'Unresolved') AS model_name,
+                   COALESCE(NULLIF(df.variant_name,''),'Unresolved') AS variant_name,
+                   df.journey_id,
+                   'delivery_tax_invoice'::text AS source_kind,
+                   a.source_pk AS source_record_id,
+                   ''::text AS addon_type_code,
+                   concat_ws(' ', a.row_data->>'description', a.row_data->>'item_code',
+                       a.row_data->>'line_category') AS evidence_text
+            FROM deal_facts df
+            JOIN analytics.snapshot_rows a
+              ON a.tenant_id=:tenant_id
+             AND a.dump_id=:dump_id
+             AND a.source_table='derived_delivery_invoice_line_items'
+             AND a.row_data->>'journey_id'=df.journey_id
+            WHERE df.has_booking
+              AND df.actual_delivered_at IS NOT NULL
+              AND upper(COALESCE(a.row_data->>'invoice_nature',''))='TAX_INVOICE'
+              AND upper(COALESCE(a.row_data->>'invoice_purpose',''))<>'ACCESSORY'
         ), classified_warranty_rsa AS (
             SELECT *,
                    CASE
@@ -1942,7 +1965,7 @@ def vas_intelligence(
                        WHERE source_kind='journey_addons'
                    )::int AS addon_source_journeys,
                    count(DISTINCT journey_id) FILTER (
-                       WHERE source_kind='accessory_tax_invoice'
+                       WHERE source_kind IN ('accessory_tax_invoice','delivery_tax_invoice')
                    )::int AS invoice_source_journeys
             FROM classified_warranty_rsa
             WHERE product_type IS NOT NULL
@@ -2139,6 +2162,268 @@ def vas_intelligence(
                      dealer_name, outlet_name, model_name, variant_name
             """,
         )
+        vas_reconciliation_cte = _DEAL_FACTS_CTE + """
+        , vas_categories(category) AS (
+            VALUES ('EW'), ('INSURANCE'), ('RSA'), ('FASTAG'), ('ACCESSORIES')
+        ), proposal_evidence AS (
+            SELECT df.dealer_id,
+                   df.dealer_name,
+                   df.outlet_id,
+                   df.outlet_name,
+                   COALESCE(NULLIF(df.model_name,''),'Unresolved') AS model_name,
+                   COALESCE(NULLIF(df.variant_name,''),'Unresolved') AS variant_name,
+                   df.journey_id,
+                   CASE
+                       WHEN upper(COALESCE(a.row_data->>'addon_type_code',''))
+                                IN ('EW','EXTENDED_WARRANTY','EXTENDED WARRANTY')
+                         OR upper(COALESCE(a.row_data->>'addon_type_code','')) LIKE '%WARRANT%'
+                           THEN 'EW'
+                       WHEN upper(COALESCE(a.row_data->>'addon_type_code',''))
+                                IN ('RSA','ROADSIDE_ASSISTANCE','ROADSIDE ASSISTANCE')
+                         OR upper(COALESCE(a.row_data->>'addon_type_code','')) LIKE '%ROAD%'
+                           THEN 'RSA'
+                       WHEN upper(COALESCE(a.row_data->>'addon_type_code',''))
+                                IN ('FASTAG','FAST_TAG','FAST TAG')
+                         OR upper(COALESCE(a.row_data->>'addon_type_code','')) LIKE '%FAST%TAG%'
+                           THEN 'FASTAG'
+                       WHEN upper(COALESCE(a.row_data->>'addon_type_code',''))
+                                IN ('INS','INSURANCE','MOTOR_INSURANCE','INSURANCE_PREMIUM')
+                         OR upper(COALESCE(a.row_data->>'addon_type_code','')) LIKE '%INSUR%'
+                           THEN 'INSURANCE'
+                       WHEN upper(COALESCE(a.row_data->>'addon_type_code',''))
+                                IN ('ACCESSORY','ACCESSORIES','ACCESSORIES_TOTAL')
+                         OR upper(COALESCE(a.row_data->>'addon_type_code','')) LIKE '%ACCESSOR%'
+                           THEN 'ACCESSORIES'
+                   END AS category
+            FROM deal_facts df
+            JOIN analytics.snapshot_rows a
+              ON a.tenant_id=:tenant_id
+             AND a.dump_id=:dump_id
+             AND a.source_table='journey_addons'
+             AND a.row_data->>'journey_id'=df.journey_id
+            WHERE df.has_booking
+        ), proposal_by_journey AS (
+            SELECT dealer_id, dealer_name, outlet_id, outlet_name,
+                   model_name, variant_name, journey_id, category,
+                   count(*)::int AS proposal_record_count
+            FROM proposal_evidence
+            WHERE category IS NOT NULL
+            GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
+                     model_name, variant_name, journey_id, category
+        ), delivery_invoice_lines AS (
+            SELECT df.dealer_id,
+                   df.dealer_name,
+                   df.outlet_id,
+                   df.outlet_name,
+                   COALESCE(NULLIF(df.model_name,''),'Unresolved') AS model_name,
+                   COALESCE(NULLIF(df.variant_name,''),'Unresolved') AS variant_name,
+                   df.journey_id,
+                   split_part(a.source_pk,':',1) AS invoice_document_id,
+                   a.source_pk AS invoice_line_id,
+                   upper(COALESCE(a.row_data->>'invoice_purpose','')) AS invoice_purpose,
+                   CASE
+                       WHEN concat_ws(' ',
+                                a.row_data->>'description', a.row_data->>'item_code',
+                                a.row_data->>'line_category', a.row_data->>'invoice_purpose'
+                            ) ~* '(extended[[:space:]_-]*warrant|(^|[^A-Z0-9])warranty([^A-Z0-9]|$))'
+                           THEN 'EW'
+                       WHEN concat_ws(' ',
+                                a.row_data->>'description', a.row_data->>'item_code',
+                                a.row_data->>'line_category', a.row_data->>'invoice_purpose'
+                            ) ~* '(road[[:space:]_-]*side[[:space:]_-]*assist|roadside|(^|[^A-Z0-9])RSA([^A-Z0-9]|$))'
+                           THEN 'RSA'
+                       WHEN concat_ws(' ',
+                                a.row_data->>'description', a.row_data->>'item_code',
+                                a.row_data->>'line_category', a.row_data->>'invoice_purpose'
+                            ) ~* 'fast[[:space:]_-]*tag'
+                           THEN 'FASTAG'
+                       WHEN concat_ws(' ',
+                                a.row_data->>'description', a.row_data->>'item_code',
+                                a.row_data->>'line_category', a.row_data->>'invoice_purpose'
+                            ) ~* '(insurance|premium)'
+                           THEN 'INSURANCE'
+                       WHEN upper(COALESCE(a.row_data->>'line_category','')) ~ 'ACCESSOR'
+                         OR upper(COALESCE(a.row_data->>'invoice_purpose',''))='ACCESSORY'
+                           THEN 'ACCESSORIES'
+                   END AS category
+            FROM deal_facts df
+            JOIN analytics.snapshot_rows a
+              ON a.tenant_id=:tenant_id
+             AND a.dump_id=:dump_id
+             AND a.source_table='derived_delivery_invoice_line_items'
+             AND a.row_data->>'journey_id'=df.journey_id
+            WHERE df.has_booking
+              AND df.actual_delivered_at IS NOT NULL
+              AND upper(COALESCE(a.row_data->>'invoice_nature',''))='TAX_INVOICE'
+        ), invoice_coverage_by_journey AS (
+            SELECT journey_id,
+                   count(DISTINCT invoice_document_id)::int AS invoice_document_count
+            FROM delivery_invoice_lines
+            GROUP BY journey_id
+        ), invoice_purchase_by_journey AS (
+            SELECT dealer_id, dealer_name, outlet_id, outlet_name,
+                   model_name, variant_name, journey_id, category,
+                   count(DISTINCT invoice_line_id)::int AS invoice_line_count,
+                   count(DISTINCT invoice_document_id)::int AS invoice_document_count,
+                   string_agg(DISTINCT NULLIF(invoice_purpose,''), ', '
+                       ORDER BY NULLIF(invoice_purpose,'')) AS invoice_purposes
+            FROM delivery_invoice_lines
+            WHERE category IS NOT NULL
+            GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
+                     model_name, variant_name, journey_id, category
+        ), booked_journey_categories AS (
+            SELECT df.dealer_id,
+                   df.dealer_name,
+                   df.outlet_id,
+                   df.outlet_name,
+                   COALESCE(NULLIF(df.model_name,''),'Unresolved') AS model_name,
+                   COALESCE(NULLIF(df.variant_name,''),'Unresolved') AS variant_name,
+                   df.journey_id,
+                   df.actual_delivered_at,
+                   c.category,
+                   COALESCE(p.proposal_record_count,0) AS proposal_record_count,
+                   COALESCE(i.invoice_line_count,0) AS invoice_line_count,
+                   COALESCE(i.invoice_document_count,0) AS invoice_document_count,
+                   i.invoice_purposes,
+                   COALESCE(ic.invoice_document_count,0)>0 AS has_invoice_evidence,
+                   COALESCE(i.invoice_line_count,0)>0 AS invoice_purchase_observed
+            FROM deal_facts df
+            CROSS JOIN vas_categories c
+            LEFT JOIN proposal_by_journey p
+              ON p.journey_id=df.journey_id AND p.category=c.category
+            LEFT JOIN invoice_purchase_by_journey i
+              ON i.journey_id=df.journey_id AND i.category=c.category
+            LEFT JOIN invoice_coverage_by_journey ic
+              ON ic.journey_id=df.journey_id
+            WHERE df.has_booking
+        )
+        """
+        reconciliation_by_category = _rows(
+            connection,
+            latest,
+            tenant_id,
+            vas_reconciliation_cte
+            + """
+            SELECT c.category,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.proposal_record_count>0
+                   )::int
+                       AS booked_proposal_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.proposal_record_count>0 AND r.actual_delivered_at IS NOT NULL
+                   )::int AS delivered_proposal_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.invoice_purchase_observed
+                   )::int
+                       AS delivery_invoice_purchase_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.proposal_record_count>0 AND r.invoice_purchase_observed
+                   )::int AS proposed_and_invoiced_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.proposal_record_count>0 AND r.has_invoice_evidence
+                         AND NOT r.invoice_purchase_observed
+                   )::int AS proposal_not_observed_on_invoice_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.proposal_record_count>0 AND r.actual_delivered_at IS NOT NULL
+                         AND NOT r.has_invoice_evidence
+                   )::int AS proposal_without_invoice_evidence_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.invoice_purchase_observed AND r.proposal_record_count=0
+                   )::int AS invoice_only_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.has_invoice_evidence
+                   )::int
+                       AS invoice_covered_delivered_journeys,
+                   round(
+                       100.0 * count(DISTINCT r.journey_id) FILTER (
+                           WHERE r.proposal_record_count>0 AND r.invoice_purchase_observed
+                       ) / NULLIF(count(DISTINCT r.journey_id) FILTER (
+                           WHERE r.proposal_record_count>0 AND r.has_invoice_evidence
+                       ),0),
+                       1
+                   ) AS proposal_invoice_match_pct
+            FROM vas_categories c
+            LEFT JOIN booked_journey_categories r ON r.category=c.category
+            GROUP BY c.category
+            ORDER BY CASE c.category
+                WHEN 'EW' THEN 1 WHEN 'INSURANCE' THEN 2 WHEN 'RSA' THEN 3
+                WHEN 'FASTAG' THEN 4 ELSE 5 END
+            """,
+        )
+        reconciliation_by_deal = _rows(
+            connection,
+            latest,
+            tenant_id,
+            vas_reconciliation_cte
+            + """
+            SELECT dealer_id,
+                   dealer_name,
+                   outlet_id,
+                   outlet_name,
+                   model_name,
+                   variant_name,
+                   category,
+                   count(*) FILTER (WHERE proposal_record_count>0)::int
+                       AS booked_proposal_journeys,
+                   count(*) FILTER (
+                       WHERE proposal_record_count>0 AND actual_delivered_at IS NOT NULL
+                   )::int AS delivered_proposal_journeys,
+                   count(*) FILTER (WHERE invoice_purchase_observed)::int
+                       AS delivery_invoice_purchase_journeys,
+                   count(*) FILTER (
+                       WHERE proposal_record_count>0 AND invoice_purchase_observed
+                   )::int AS proposed_and_invoiced_journeys,
+                   count(*) FILTER (
+                       WHERE proposal_record_count>0 AND has_invoice_evidence
+                         AND NOT invoice_purchase_observed
+                   )::int AS proposal_not_observed_on_invoice_journeys,
+                   count(*) FILTER (
+                       WHERE proposal_record_count>0 AND actual_delivered_at IS NOT NULL
+                         AND NOT has_invoice_evidence
+                   )::int AS proposal_without_invoice_evidence_journeys,
+                   count(*) FILTER (
+                       WHERE invoice_purchase_observed AND proposal_record_count=0
+                   )::int AS invoice_only_journeys,
+                   string_agg(DISTINCT invoice_purposes, '; '
+                       ORDER BY invoice_purposes) FILTER (
+                       WHERE invoice_purchase_observed AND invoice_purposes IS NOT NULL
+                   ) AS invoice_purposes
+            FROM booked_journey_categories
+            GROUP BY dealer_id, dealer_name, outlet_id, outlet_name,
+                     model_name, variant_name, category
+            HAVING count(*) FILTER (WHERE proposal_record_count>0)>0
+                OR count(*) FILTER (WHERE invoice_purchase_observed)>0
+            ORDER BY dealer_name, outlet_name, model_name, variant_name, category
+            """,
+        )
+        reconciliation_coverage = _scalar_row(
+            _rows(
+                connection,
+                latest,
+                tenant_id,
+                vas_reconciliation_cte
+                + """
+                SELECT count(DISTINCT journey_id) FILTER (
+                           WHERE actual_delivered_at IS NOT NULL
+                       )::int AS delivered_journeys,
+                       count(DISTINCT journey_id) FILTER (
+                           WHERE actual_delivered_at IS NOT NULL AND has_invoice_evidence
+                       )::int AS delivered_journeys_with_tax_invoice_lines,
+                       (SELECT count(DISTINCT invoice_document_id)::int
+                        FROM delivery_invoice_lines) AS delivery_tax_invoice_documents,
+                       (SELECT count(*)::int FROM delivery_invoice_lines)
+                           AS delivery_tax_invoice_lines,
+                       (SELECT count(*)::int FROM delivery_invoice_lines
+                        WHERE category IS NULL) AS unclassified_tax_invoice_lines,
+                       round(100.0 * count(DISTINCT journey_id) FILTER (
+                           WHERE actual_delivered_at IS NOT NULL AND has_invoice_evidence
+                       ) / NULLIF(count(DISTINCT journey_id) FILTER (
+                           WHERE actual_delivered_at IS NOT NULL
+                       ),0),1) AS invoice_coverage_pct
+                FROM booked_journey_categories
+                """,
+            )
+        )
     finally:
         connection.close()
 
@@ -2157,6 +2442,20 @@ def vas_intelligence(
         "accessory_items": accessory_items,
         "accessory_line_coverage": accessory_line_coverage,
         "by_model_outlet": by_model_outlet,
+        "booking_invoice_reconciliation": {
+            "by_category": reconciliation_by_category,
+            "by_dealer_model_variant": reconciliation_by_deal,
+            "invoice_coverage": reconciliation_coverage,
+            "definition": (
+                "A booking proposal is a captured journey_addons category record linked to a booked "
+                "journey; Audit Core currently does not provide a separate proposal/acceptance state. "
+                "Invoice purchases are classified from redacted line descriptions, item codes and "
+                "categories on confirmed TAX_INVOICE records linked to completed deliveries. A proposal "
+                "without a matching line is called not observed only when tax-invoice lines exist for "
+                "that delivered journey. Missing invoice evidence and unclassified lines remain unknown, "
+                "not zero or not purchased."
+            ),
+        },
         "accessory_codes": ["ACCESSORY", "ACCESSORIES", "ACCESSORIES_TOTAL"],
         "definition": (
             "Add-on records show the captured VAS category by dealer, outlet, model, and variant. "
