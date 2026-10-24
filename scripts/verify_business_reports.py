@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from decimal import Decimal
 
 from sqlalchemy import text
@@ -19,12 +20,15 @@ from analytics.business_intelligence import (
     sales_product,
     vas_intelligence,
 )
+from analytics.config import load_settings
+from analytics.db import source_engine
 from analytics.reports import productivity
 
 
 def _print_data_diagnostics(
     tenant_id: str,
     vas: dict,
+    insurance: dict,
     geography: dict,
 ) -> None:
     """Emit privacy-safe business dimensions for report/UI validation."""
@@ -79,6 +83,80 @@ def _print_data_diagnostics(
             ),
             params,
         ).mappings().all()
+        term_evidence = connection.execute(
+            text(
+                """
+                WITH candidate_fields AS (
+                    SELECT snapshot.source_table,
+                           snapshot.source_pk,
+                           field.key AS field_name,
+                           field.value AS field_value,
+                           upper(COALESCE(snapshot.row_data->>'addon_type_code','')) AS addon_type
+                    FROM analytics.snapshot_rows snapshot
+                    CROSS JOIN LATERAL jsonb_each_text(snapshot.row_data) AS field(key, value)
+                    WHERE snapshot.tenant_id=:tenant_id AND snapshot.dump_id=:dump_id
+                      AND snapshot.source_table IN (
+                          'journey_addons', 'derived_accessory_line_items',
+                          'commercial_lines', 'insurance_records'
+                      )
+                      AND (
+                          field.value ~* '(warrant|RSA|road[[:space:]_-]*side[[:space:]_-]*assist)'
+                          OR (snapshot.source_table='journey_addons'
+                              AND upper(COALESCE(snapshot.row_data->>'addon_type_code',''))='EW'
+                              AND field.key='details')
+                      )
+                ), categorized AS (
+                    SELECT source_table, source_pk, field_name, addon_type,
+                           CASE
+                               WHEN (field_value ~* 'warrant'
+                                     OR (source_table='journey_addons' AND addon_type='EW'))
+                                    AND field_value ~* '(4[[:space:]_-]*(year|yr|y)|48[[:space:]_-]*month|four[[:space:]_-]*year)'
+                                   THEN 'FOUR_YEAR'
+                               WHEN (field_value ~* 'warrant'
+                                     OR (source_table='journey_addons' AND addon_type='EW'))
+                                    AND field_value ~* '(5[[:space:]_-]*(year|yr|y)|60[[:space:]_-]*month|five[[:space:]_-]*year)'
+                                   THEN 'FIVE_YEAR'
+                               WHEN field_value ~* 'warrant'
+                                    OR (source_table='journey_addons' AND addon_type='EW')
+                                   THEN 'WARRANTY_TERM_UNSPECIFIED'
+                               WHEN field_value ~* '(road[[:space:]_-]*side[[:space:]_-]*assist|roadside|(^|[^A-Z0-9])RSA([^A-Z0-9]|$))'
+                                    OR (source_table='journey_addons' AND addon_type='RSA')
+                                   THEN 'RSA'
+                           END AS evidence_type
+                    FROM candidate_fields
+                )
+                SELECT source_table, field_name, evidence_type,
+                       count(DISTINCT source_pk)::int AS source_records
+                FROM categorized
+                WHERE evidence_type IS NOT NULL
+                GROUP BY source_table, field_name, evidence_type
+                ORDER BY source_table, field_name, evidence_type
+                """
+            ),
+            params,
+        ).mappings().all()
+        warranty_accessory_lines = connection.execute(
+            text(
+                """
+                SELECT upper(COALESCE(NULLIF(row_data->>'invoice_nature',''),'UNCLASSIFIED')) AS invoice_nature,
+                       COALESCE(NULLIF(row_data->>'line_category',''),'Uncategorized') AS line_category,
+                       COALESCE(NULLIF(row_data->>'description',''),
+                                NULLIF(row_data->>'item_code',''),'Unlabelled') AS item_description,
+                       NULLIF(row_data->>'item_code','') AS item_code,
+                       count(*)::int AS invoice_lines,
+                       sum(NULLIF(row_data->>'quantity','')::numeric) AS invoiced_quantity,
+                       sum(NULLIF(row_data->>'net_amount','')::numeric) AS net_amount
+                FROM analytics.snapshot_rows
+                WHERE tenant_id=:tenant_id AND dump_id=:dump_id
+                  AND source_table='derived_accessory_line_items'
+                  AND COALESCE(row_data->>'description','') || ' ' ||
+                      COALESCE(row_data->>'item_code','') ~* '(warrant|RSA|road[[:space:]_-]*side[[:space:]_-]*assist)'
+                GROUP BY invoice_nature, line_category, item_description, item_code
+                ORDER BY invoice_lines DESC, item_description
+                """
+            ),
+            params,
+        ).mappings().all()
         insurance_evidence = connection.execute(
             text(
                 _DEAL_FACTS_CTE
@@ -114,6 +192,16 @@ def _print_data_diagnostics(
         + json.dumps([dict(row) for row in term_values], separators=(",", ":"))
     )
     print(
+        "ADDON_TERM_EVIDENCE|"
+        f"tenant={tenant_id}|"
+        + json.dumps([dict(row) for row in term_evidence], separators=(",", ":"))
+    )
+    print(
+        "ACCESSORY_WARRANTY_RSA_LINES|"
+        f"tenant={tenant_id}|"
+        + json.dumps([dict(row) for row in warranty_accessory_lines], separators=(",", ":"), default=str)
+    )
+    print(
         "INSURANCE_SOURCE_CODES_BY_OUTLET|"
         f"tenant={tenant_id}|"
         + json.dumps([dict(row) for row in insurance_evidence], separators=(",", ":"))
@@ -127,6 +215,34 @@ def _print_data_diagnostics(
         f"tenant={tenant_id}|"
         + json.dumps(product_addons, separators=(",", ":"), default=str)
     )
+    print(
+        "JOURNEY_ADDON_CODES|"
+        f"tenant={tenant_id}|"
+        + json.dumps(vas.get("by_type", []), separators=(",", ":"), default=str)
+    )
+    reconciliation = vas.get("booking_invoice_reconciliation", {})
+    print(
+        "BOOKING_INVOICE_VAS_RECONCILIATION|"
+        f"tenant={tenant_id}|"
+        + json.dumps(
+            {
+                "invoice_coverage": reconciliation.get("invoice_coverage", {}),
+                "by_category": reconciliation.get("by_category", []),
+            },
+            separators=(",", ":"),
+            default=str,
+        )
+    )
+    policy_terms = [
+        row for row in insurance.get("add_ons", [])
+        if any(re.search(r"warrant|rsa|roadside|assistance", term, re.IGNORECASE)
+               for term in row.get("raw_terms", []))
+    ]
+    print(
+        "INSURANCE_WARRANTY_RSA_TERMS_BY_OUTLET|"
+        f"tenant={tenant_id}|"
+        + json.dumps(policy_terms, separators=(",", ":"), default=str)
+    )
     accessory_rows = sorted(
         vas.get("accessory_items", []),
         key=lambda row: (
@@ -139,6 +255,109 @@ def _print_data_diagnostics(
         "ACCESSORY_DETAIL_SAMPLE|"
         f"tenant={tenant_id}|"
         + json.dumps(accessory_rows[:60], separators=(",", ":"), default=str)
+    )
+
+
+def _print_delivery_invoice_diagnostics(tenant_id: str) -> None:
+    """Report safe invoice document and VAS line counts without emitting line text."""
+    source_schema = load_settings(require_security=False).source_schema
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", source_schema):
+        raise ValueError("Unsafe source schema identifier")
+
+    with source_engine().connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            params = {"tenant_id": tenant_id}
+            document_rows = connection.execute(
+                text(
+                    f"""
+                    SELECT upper(COALESCE(NULLIF(trim(invoice_purpose),''),'(BLANK)'))
+                               AS invoice_purpose,
+                           upper(COALESCE(NULLIF(trim(document_type_key),''),'(BLANK)'))
+                               AS document_type_key,
+                           upper(COALESCE(NULLIF(trim(invoice_nature),''),'(BLANK)'))
+                               AS invoice_nature,
+                           count(*)::int AS invoice_documents,
+                           count(*) FILTER (
+                               WHERE jsonb_typeof(line_items)='array'
+                                 AND jsonb_array_length(line_items)>0
+                           )::int AS documents_with_lines
+                    FROM {source_schema}.invoice_review_values
+                    WHERE tenant_id=:tenant_id
+                    GROUP BY 1, 2, 3
+                    ORDER BY invoice_documents DESC, 1, 2, 3
+                    """
+                ),
+                params,
+            ).mappings().all()
+            line_rows = connection.execute(
+                text(
+                    f"""
+                    WITH invoice_lines AS (
+                        SELECT d.invoice_review_value_id,
+                               d.journey_id,
+                               upper(COALESCE(NULLIF(trim(d.invoice_purpose),''),'(BLANK)'))
+                                   AS invoice_purpose,
+                               upper(COALESCE(NULLIF(trim(d.document_type_key),''),'(BLANK)'))
+                                   AS document_type_key,
+                               upper(COALESCE(NULLIF(trim(d.invoice_nature),''),'(BLANK)'))
+                                   AS invoice_nature,
+                               upper(COALESCE(NULLIF(trim(item.value->>'line_category'),''),''))
+                                   AS line_category,
+                               concat_ws(' ', item.value->>'description_raw',
+                                   item.value->>'item_code', item.value->>'line_category')
+                                   AS line_evidence
+                        FROM {source_schema}.invoice_review_values d
+                        CROSS JOIN LATERAL jsonb_array_elements(
+                            CASE WHEN jsonb_typeof(d.line_items)='array'
+                                 THEN d.line_items ELSE '[]'::jsonb END
+                        ) AS item(value)
+                        WHERE d.tenant_id=:tenant_id
+                    ), classified AS (
+                        SELECT *,
+                               CASE
+                                   WHEN line_evidence ~* '(extended[[:space:]_-]*warrant|warrant)'
+                                       THEN 'EW'
+                                   WHEN line_evidence ~* '(road[[:space:]_-]*side[[:space:]_-]*assist|roadside|(^|[^A-Z0-9])RSA([^A-Z0-9]|$))'
+                                       THEN 'RSA'
+                                   WHEN line_evidence ~* 'fast[[:space:]_-]*tag'
+                                       THEN 'FASTAG'
+                                   WHEN line_evidence ~* 'insurance|premium'
+                                       THEN 'INSURANCE'
+                                   WHEN line_category ~* 'accessor'
+                                     OR invoice_purpose='ACCESSORY'
+                                       THEN 'ACCESSORY'
+                               END AS vas_category
+                        FROM invoice_lines
+                    )
+                    SELECT invoice_purpose, document_type_key, invoice_nature,
+                           COALESCE(vas_category,'OTHER_OR_UNMATCHED') AS vas_category,
+                           count(*)::int AS invoice_lines,
+                           count(DISTINCT invoice_review_value_id)::int AS invoice_count,
+                           count(DISTINCT journey_id)::int AS journey_count
+                    FROM classified
+                    GROUP BY invoice_purpose, document_type_key, invoice_nature, vas_category
+                    ORDER BY invoice_purpose, document_type_key, invoice_nature,
+                             vas_category, invoice_lines DESC
+                    """
+                ),
+                params,
+            ).mappings().all()
+            transaction.commit()
+        except Exception:
+            transaction.rollback()
+            raise
+
+    print(
+        "DELIVERY_INVOICE_PURPOSE_COVERAGE|"
+        f"tenant={tenant_id}|"
+        + json.dumps([dict(row) for row in document_rows], separators=(",", ":"))
+    )
+    print(
+        "DELIVERY_INVOICE_VAS_LINE_COVERAGE|"
+        f"tenant={tenant_id}|"
+        + json.dumps([dict(row) for row in line_rows], separators=(",", ":"))
     )
 
 
@@ -201,6 +420,20 @@ def verify_tenant(tenant_id: str) -> None:
         "dealer_name" in row and "outlet_name" in row
         for row in accessories["accessory_items"]
     )
+    reconciliation = accessories["booking_invoice_reconciliation"]
+    required_vas = {"EW", "INSURANCE", "RSA", "FASTAG", "ACCESSORIES"}
+    assert {row["category"] for row in reconciliation["by_category"]} == required_vas
+    reconciliation_coverage = reconciliation["invoice_coverage"]
+    assert int(reconciliation_coverage.get("delivered_journeys_with_tax_invoice_lines") or 0) <= int(
+        reconciliation_coverage.get("delivered_journeys") or 0
+    )
+    for row in reconciliation["by_category"]:
+        assert int(row["proposed_and_invoiced_journeys"]) <= int(
+            row["delivered_proposal_journeys"]
+        )
+        assert int(row["proposal_not_observed_on_invoice_journeys"]) <= int(
+            row["invoice_covered_delivered_journeys"]
+        )
 
     assert "by_lender_outlet" in finance and "by_outlet" in finance
     assert "by_channel" in payments and "by_outlet" in payments
@@ -214,7 +447,8 @@ def verify_tenant(tenant_id: str) -> None:
         int(row.get("delivered_units") or 0)
         for row in sales["by_dealer_model_variant"]
     )
-    _print_data_diagnostics(tenant_id, accessories, geography)
+    _print_data_diagnostics(tenant_id, accessories, insurance, geography)
+    _print_delivery_invoice_diagnostics(tenant_id)
     print(
         "BUSINESS_REPORTS_VERIFIED"
         f"|tenant={tenant_id}"

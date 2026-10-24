@@ -95,7 +95,7 @@ jobs:
           echo "Tenants to dump: $CLEANED"
 
       - name: Dump Mahindra Orissa (afa9e32b)
-        if: contains(steps.tenants.outputs.tenant_list, 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572')
+        if: github.event_name != 'push' && contains(steps.tenants.outputs.tenant_list, 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572')
         run: |
           set -euo pipefail
           echo "::group::Dumping Mahindra Orissa"
@@ -106,7 +106,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Dump Hyundai Orissa (4c4bef2a)
-        if: contains(steps.tenants.outputs.tenant_list, '4c4bef2a-1d01-498f-98b4-e4f9311282fb')
+        if: github.event_name != 'push' && contains(steps.tenants.outputs.tenant_list, '4c4bef2a-1d01-498f-98b4-e4f9311282fb')
         run: |
           set -euo pipefail
           echo "::group::Dumping Hyundai Orissa"
