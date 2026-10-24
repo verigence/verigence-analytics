@@ -2309,6 +2309,7 @@ def vas_intelligence(
                    df.actual_delivered_at,
                    c.category,
                    COALESCE(p.proposal_record_count,0) AS proposal_record_count,
+                   COALESCE(df.has_delivery_record,false) AS has_delivery_record,
                    COALESCE(i.invoice_line_count,0) AS invoice_line_count,
                    COALESCE(i.invoice_document_count,0) AS invoice_document_count,
                    i.invoice_purposes,
@@ -2346,6 +2347,9 @@ def vas_intelligence(
                    count(DISTINCT r.journey_id) FILTER (
                        WHERE r.proposal_record_count>0 AND r.actual_delivered_at IS NOT NULL
                    )::int AS delivered_proposal_journeys,
+                   count(DISTINCT r.journey_id) FILTER (
+                       WHERE r.proposal_record_count>0 AND NOT r.has_delivery_record
+                   )::int AS invoice_awaiting_journeys,
                    count(DISTINCT r.journey_id) FILTER (
                        WHERE r.invoice_purchase_observed
                    )::int
@@ -2411,6 +2415,9 @@ def vas_intelligence(
                    count(*) FILTER (
                        WHERE proposal_record_count>0 AND actual_delivered_at IS NOT NULL
                    )::int AS delivered_proposal_journeys,
+                   count(*) FILTER (
+                       WHERE proposal_record_count>0 AND NOT has_delivery_record
+                   )::int AS invoice_awaiting_journeys,
                    count(*) FILTER (WHERE invoice_purchase_observed)::int
                        AS delivery_invoice_purchase_journeys,
                    count(*) FILTER (
@@ -2517,15 +2524,13 @@ def vas_intelligence(
             "by_dealer_model_variant": reconciliation_by_deal,
             "invoice_coverage": reconciliation_coverage,
             "definition": (
-                "A booking proposal is a captured journey_addons category record linked to a booked "
+            "A booking proposal is a captured journey_addons category record linked to a booked "
                 "journey; Audit Core currently does not provide a separate proposal/acceptance state. "
-                "Confirmed invoice purchases are classified from redacted line descriptions, item codes "
-                "and categories on TAX_INVOICE records linked to completed deliveries. A matching VAS "
-                "line on a document whose invoice nature is UNKNOWN is surfaced as unverified evidence, "
-                "not counted as bought and not treated as a missing sale. A proposal without a matching "
-                "line is called not observed only when confirmed tax-invoice lines exist for that delivered "
-                "journey and no unverified category match exists. Missing invoice evidence and "
-                "unclassified lines remain unknown, not zero or not purchased."
+                "Invoice purchases are counted only when category evidence is present on a confirmed "
+                "TAX_INVOICE linked to the journey. Invoice-awaiting counts include only booking proposals "
+                "for journeys with no delivery record uploaded. A journey with a delivery record but no "
+                "matching confirmed invoice line is excluded from these three states; missing or unclassified "
+                "evidence is not interpreted as a purchase or a non-purchase."
             ),
         },
         "accessory_codes": ["ACCESSORY", "ACCESSORIES", "ACCESSORIES_TOTAL"],
