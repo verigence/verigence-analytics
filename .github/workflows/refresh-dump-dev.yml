@@ -1,7 +1,11 @@
 name: Refresh Analytics Dump DEV
 
-# Refreshes after a successful DEV deployment, nightly at 03:00 Asia/Kolkata, or on demand.
-# The nightly run pulls fresh Audit Core data for included DEV tenants.
+# Refreshes after a successful DEV deployment, every morning at 08:30 Asia/Kolkata, or on demand.
+# The morning run pulls fresh Audit Core data for included DEV tenants.
+#
+# 08:30, not 03:00 (product owner 2026-11-13): the system sleeps from 00:30 to 08:00 India time so the
+# database is not billed at night, and a copy at 03:00 woke it. All of the previous day's work is in by
+# midnight, so the morning copy carries the same data.
 #
 # Analytics DEV tenant scope:
 #   Mahindra Orissa afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
@@ -14,7 +18,7 @@ on:
     types: [completed]
     branches: [main]
   schedule:
-    - cron: '30 21 * * *' # 03:00 Asia/Kolkata
+    - cron: '0 3 * * *' # 08:30 Asia/Kolkata
   push:
     branches: [main]
     paths:
